@@ -202,6 +202,8 @@ gpujpeg_decoder_init(struct gpujpeg_decoder* decoder, const struct gpujpeg_param
     change |= coder->param.restart_interval != param->restart_interval;
     change |= coder->param.interleaved != param->interleaved;
     change |= coder->param.color_space_internal != param->color_space_internal;
+    change |= coder->param_image.color_space != param_image->color_space;
+    change |= coder->param_image.pixel_format != param_image->pixel_format;
     for ( int comp = 0; comp < param->comp_count; comp++ ) {
         change |= coder->param.sampling_factor[comp].horizontal != param->sampling_factor[comp].horizontal;
         change |= coder->param.sampling_factor[comp].vertical != param->sampling_factor[comp].vertical;
@@ -209,8 +211,8 @@ gpujpeg_decoder_init(struct gpujpeg_decoder* decoder, const struct gpujpeg_param
     if ( change == 0 )
         return 0;
 
-    // For now we can't reinitialize decoder, we can only do first initialization
-    if ( coder->param_image.width != 0 || coder->param_image.height != 0 || coder->param.comp_count != 0 ) {
+    if ( coder->param.verbose >= GPUJPEG_LL_INFO &&
+         (coder->param_image.width != 0 || coder->param_image.height != 0 || coder->param.comp_count != 0) ) {
         fprintf(stderr, "[GPUJPEG] [Info] Reinitializing decoder.\n");
     }
 
