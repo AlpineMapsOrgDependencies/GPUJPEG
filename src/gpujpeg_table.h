@@ -31,6 +31,7 @@
 #ifndef GPUJPEG_TABLE_H
 #define GPUJPEG_TABLE_H
 
+#include "../libgpujpeg/gpujpeg_common.h" // cudaStream_t
 #include "../libgpujpeg/gpujpeg_type.h"
 
 #ifdef __cplusplus
@@ -94,6 +95,8 @@ struct gpujpeg_table_quantization
     uint16_t* d_table;
     /// Quantization table for forward DCT, pre-divided with output DCT weights and transposed for coealescent access
     float* d_table_forward;
+    /// host copy of d_table_forward (source of its asynchronous upload)
+    float table_forward[64];
 };
 
 /** JPEG table for huffman encoding */
@@ -137,10 +140,12 @@ struct gpujpeg_table_huffman_decoder {
  * @param table  Table structure
  * @param type  Type of component for table
  * @param quality  Quality (0-100)
+ * @param stream  stream to upload the table in
  * @return 0 if succeeds, otherwise nonzero
  */
 int
-gpujpeg_table_quantization_encoder_init(struct gpujpeg_table_quantization* table, enum gpujpeg_component_type type, int quality);
+gpujpeg_table_quantization_encoder_init(struct gpujpeg_table_quantization* table, enum gpujpeg_component_type type,
+                                        int quality, cudaStream_t stream);
 
 /**
  * Init JPEG quantization table for decoder
@@ -157,10 +162,11 @@ gpujpeg_table_quantization_decoder_init(struct gpujpeg_table_quantization* table
  * Compute JPEG quantization table for decoder
  * 
  * @param table  Table structure
+ * @param stream  stream to upload the table in
  * @return 0 if succeeds, otherwise nonzero
  */
 int
-gpujpeg_table_quantization_decoder_compute(struct gpujpeg_table_quantization* table);
+gpujpeg_table_quantization_decoder_compute(struct gpujpeg_table_quantization* table, cudaStream_t stream);
 
 /**
  * Print JPEG quantization table

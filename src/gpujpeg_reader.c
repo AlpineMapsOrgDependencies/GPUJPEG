@@ -720,7 +720,7 @@ gpujpeg_reader_read_dqt(struct gpujpeg_decoder* decoder, uint8_t** image, const 
         }
 
         // Prepare quantization table for read raw table
-        gpujpeg_table_quantization_decoder_compute(table);
+        gpujpeg_table_quantization_decoder_compute(table, decoder->coder.stream);
 
         if (decoder->coder.param.verbose >= GPUJPEG_LL_DEBUG2) {
             PRINTF("Quantization table 0x%02x (%d-bit, dst: %d):\n", index, (Pq + 1) * 8, Tq);
