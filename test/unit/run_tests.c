@@ -96,6 +96,10 @@ test_chroma_filter();
 void
 test_concurrency();
 
+// defined in test_allocator.c
+void
+test_allocator();
+
 static char*
 test_format_number_with_delim() {
         struct {
@@ -142,6 +146,7 @@ int main() {
         test_coder_reinit();
         test_chroma_filter();
         test_concurrency();
+        test_allocator();
         printf("PASSED\n");
 }
 
