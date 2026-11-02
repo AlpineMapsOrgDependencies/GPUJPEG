@@ -1160,6 +1160,8 @@ gpujpeg_huffman_gpu_encoder_encode(struct gpujpeg_encoder* encoder, struct gpujp
     // Read and return number of occupied bytes
     cudaMemcpyAsync(output_byte_count, huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count, sizeof(unsigned int),
                     cudaMemcpyDeviceToHost, coder->stream);
+    // the caller uses the value right away (a copy to pageable memory needn't be complete on return)
+    cudaStreamSynchronize(coder->stream);
     gpujpeg_cuda_check_error("Huffman output size getting failed", return -1);
 
     // indicate success
