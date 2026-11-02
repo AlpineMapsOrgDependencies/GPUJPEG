@@ -530,6 +530,8 @@ gpujpeg_decoder_destroy(struct gpujpeg_decoder* decoder)
 {
     assert(decoder != NULL);
 
+    // queued work may still use the coder memory (eg. if decoding failed before its synchronization)
+    cudaStreamSynchronize(decoder->coder.stream);
     coder_process_stats_overall(&decoder->coder);
 
     if (0 != gpujpeg_coder_deinit(&decoder->coder)) {
