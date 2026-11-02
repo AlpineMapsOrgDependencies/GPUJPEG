@@ -807,6 +807,8 @@ gpujpeg_encoder_destroy(struct gpujpeg_encoder* encoder)
 {
     assert(encoder != NULL);
 
+    // queued work may still use the coder memory (eg. if encoding failed before its synchronization)
+    cudaStreamSynchronize(encoder->coder.stream);
     coder_process_stats_overall(&encoder->coder);
 
     if (encoder->huffman_gpu_encoder != NULL) {
