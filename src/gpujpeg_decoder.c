@@ -120,6 +120,9 @@ gpujpeg_decoder_create(cudaStream_t stream)
 
     int result = 1;
 
+    // Stream
+    coder->stream = stream;
+
     // Allocate quantization tables in device memory
     for ( int comp_type = 0; comp_type < GPUJPEG_MAX_COMPONENT_COUNT; comp_type++ ) {
         if ( cudaSuccess != cudaMalloc((void**)&decoder->table_quantization[comp_type].d_table, 64 * sizeof(uint16_t)) )
@@ -132,7 +135,8 @@ gpujpeg_decoder_create(cudaStream_t stream)
                 result = 0;
             // gpujpeg_huffman_decoder_table_kernel() computes quick tables for 2 pair of Huffman tables, but eg. for grayscale only one pair is
             // present which causes the function potentially crash because computing from garbage values - memsetting to 0 fixes that
-            if ( cudaSuccess != cudaMemset(decoder->d_table_huffman[comp_type][huff_type], 0, sizeof(struct gpujpeg_table_huffman_decoder)) ) {
+            if ( cudaSuccess != cudaMemsetAsync(decoder->d_table_huffman[comp_type][huff_type], 0,
+                                                sizeof(struct gpujpeg_table_huffman_decoder), coder->stream) ) {
                 result = 0;
             }
         }
@@ -143,9 +147,6 @@ gpujpeg_decoder_create(cudaStream_t stream)
     if ((decoder->huffman_gpu_decoder = gpujpeg_huffman_gpu_decoder_init()) == NULL) {
         result = 0;
     }
-
-    // Stream
-    coder->stream = stream;
 
     if (result == 0) {
         gpujpeg_decoder_destroy(decoder);

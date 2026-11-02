@@ -941,7 +941,7 @@ gpujpeg_coder_init_image(struct gpujpeg_coder * coder, const struct gpujpeg_para
     allocated_gpu_memory_size += coder->data_allocated_size * sizeof(int16_t);
 
     if (coder->encoder) { // clear the buffer for preprocessor when the image size is not divisible by 8x8
-        cudaMemset(coder->d_data, 0, coder->data_size * sizeof(uint8_t));
+        cudaMemsetAsync(coder->d_data, 0, coder->data_size * sizeof(uint8_t), stream);
         gpujpeg_cuda_check_error("d_data memset failed", return 0);
     }
 
