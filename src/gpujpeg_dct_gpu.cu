@@ -293,10 +293,6 @@ gpujpeg_dct_gpu_kernel(int block_count_x, int block_count_y, uint8_t* source, co
     );
 }
 
-/** Quantization table */
-//TODO zmenit na float
-__constant__ uint16_t gpujpeg_idct_gpu_quantization_table[64];
-
 #if !GPUJPEG_IDCT_USE_ASM
 
 /**
@@ -699,16 +695,6 @@ gpujpeg_idct_gpu(struct gpujpeg_decoder* decoder)
         // Get quantization table
         uint16_t* d_quantization_table = decoder->table_quantization[decoder->comp_table_quantization_map[comp]].d_table;
 
-        // Copy quantization table to constant memory
-        cudaMemcpyToSymbolAsync(
-            gpujpeg_idct_gpu_quantization_table,
-            d_quantization_table,
-            64 * sizeof(uint16_t),
-            0,
-            cudaMemcpyDeviceToDevice,
-            coder->stream
-        );
-        gpujpeg_cuda_check_error("Copy IDCT quantization table to constant memory", return -1);
 
         dim3 dct_grid(gpujpeg_div_and_round_up(block_count_x * block_count_y,
 				(GPUJPEG_IDCT_BLOCK_X * GPUJPEG_IDCT_BLOCK_Y * GPUJPEG_IDCT_BLOCK_Z) / GPUJPEG_BLOCK_SIZE), 1);
