@@ -104,7 +104,6 @@ gpujpeg_encoder_input_texture(struct gpujpeg_opengl_texture* texture)
 struct gpujpeg_encoder*
 gpujpeg_encoder_create(cudaStream_t stream)
 {
-    gpujpeg_init_term_colors();
     struct gpujpeg_encoder* encoder = (struct gpujpeg_encoder*) calloc(1, sizeof(struct gpujpeg_encoder));
     if ( encoder == NULL ) {
         return NULL;
