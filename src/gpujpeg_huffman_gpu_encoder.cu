@@ -35,7 +35,7 @@
 #define WARPS_NUM 8
 
 /** Natural order in constant memory */
-__constant__ int gpujpeg_huffman_gpu_encoder_order_natural[GPUJPEG_ORDER_NATURAL_SIZE];
+__constant__ int gpujpeg_huffman_gpu_encoder_order_natural[GPUJPEG_ORDER_NATURAL_SIZE] = {GPUJPEG_ORDER_NATURAL_VALUES};
 
 /**
  * Huffman coding tables in constant memory - each has 257 items (256 + 1 extra)
@@ -1013,16 +1013,6 @@ gpujpeg_huffman_gpu_encoder_create(const struct gpujpeg_encoder * encoder)
         cudaMemcpyHostToDevice
     );
     gpujpeg_cuda_check_error("Huffman encoder init (Huffman coding table)", return NULL);
-
-    // Copy natural order to constant device memory
-    cudaMemcpyToSymbol(
-        gpujpeg_huffman_gpu_encoder_order_natural,
-        gpujpeg_order_natural,
-        GPUJPEG_ORDER_NATURAL_SIZE * sizeof(int),
-        0,
-        cudaMemcpyHostToDevice
-    );
-    gpujpeg_cuda_check_error("Huffman encoder init (natural order copy)", return NULL);
 
     // Configure more shared memory for all kernels
     cudaFuncSetCacheConfig(gpujpeg_huffman_encoder_encode_kernel_warp<true>, cudaFuncCachePreferShared);
