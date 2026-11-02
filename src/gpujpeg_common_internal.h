@@ -124,9 +124,9 @@ enum {
 
 #define PRINTF(...) (void)fprintf(stderr, __VA_ARGS__)
 
-extern const char *gj_fg_red;
-extern const char *gj_fg_yellow;
-extern const char *gj_term_reset;
+#define gj_fg_red gpujpeg_term_color("\033[31m")
+#define gj_fg_yellow gpujpeg_term_color("\033[33m")
+#define gj_term_reset gpujpeg_term_color("\033[0m")
 // check __VA_OPT__ presence
 #if __STDC_VERSION__ >= 202311L || __cplusplus >= 202002L || __GNUC__ >= 8 || \
     __clang_major__ >= 9
@@ -552,8 +552,9 @@ gpujpeg_cuda_memcpy_async_partially_pinned(void* dst, const void* src, size_t co
 
 void*
 gpujpeg_cuda_malloc_host(size_t size);
-void
-gpujpeg_init_term_colors();
+/// @returns escape_seq if stderr is a terminal, otherwise ""
+const char*
+gpujpeg_term_color(const char* escape_seq);
 
 int
 gpujpeg_opt_set_channel_remap(struct gpujpeg_coder* coder, const char* val, const char* optname);
