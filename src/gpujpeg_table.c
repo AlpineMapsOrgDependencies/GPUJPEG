@@ -100,7 +100,8 @@ gpujpeg_table_quantization_apply_quality(uint8_t* table_raw, int quality)
 
 /* Documented at declaration */
 int
-gpujpeg_table_quantization_encoder_init(struct gpujpeg_table_quantization* table, enum gpujpeg_component_type type, int quality)
+gpujpeg_table_quantization_encoder_init(struct gpujpeg_table_quantization* table, enum gpujpeg_component_type type,
+                                        int quality, cudaStream_t stream)
 {
     // Load raw table in zig-zag order
     gpujpeg_table_quantization_set_default(table->table_raw, type);
@@ -112,15 +113,15 @@ gpujpeg_table_quantization_encoder_init(struct gpujpeg_table_quantization* table
     const double dct_scales[8] = {1.0, 1.387039845, 1.306562965, 1.175875602, 1.0, 0.785694958, 0.541196100, 0.275899379};
     
     // Prepare transposed float quantization table, pre-divided by output DCT weights
-    float h_quantization_table[64];
     for( unsigned int i = 0; i < 64; i++ ) {
         const unsigned int x = gpujpeg_order_natural[i] % 8;
         const unsigned int y = gpujpeg_order_natural[i] / 8;
-        h_quantization_table[x * 8 + y] = 1.0 / (table->table_raw[i] * dct_scales[x] * dct_scales[y] * 8); // 8 is the gain of 2D DCT
+        table->table_forward[x * 8 + y] = 1.0 / (table->table_raw[i] * dct_scales[x] * dct_scales[y] * 8); // 8 is the gain of 2D DCT
     }
     
-    // Copy quantization table to constant memory
-    if ( cudaSuccess != cudaMemcpy(table->d_table_forward, h_quantization_table, 64 * sizeof(float), cudaMemcpyHostToDevice) )
+    // Copy quantization table to device memory (the stream is synchronized before the encoder returns)
+    if ( cudaSuccess != cudaMemcpyAsync(table->d_table_forward, table->table_forward, sizeof table->table_forward,
+                                        cudaMemcpyHostToDevice, stream) )
         return  -1;
     gpujpeg_cuda_check_error("Copy DCT quantization table to device memory", return -1);
 
@@ -151,15 +152,16 @@ gpujpeg_table_quantization_decoder_init(struct gpujpeg_table_quantization* table
 }
 
 int
-gpujpeg_table_quantization_decoder_compute(struct gpujpeg_table_quantization* table)
+gpujpeg_table_quantization_decoder_compute(struct gpujpeg_table_quantization* table, cudaStream_t stream)
 {
     // Load inverse table from raw table
     for ( int i = 0; i < 64; i++ ) {
         table->table[gpujpeg_order_natural[i]] = table->table_raw[i];
     }
 
-    // Copy tables to device memory
-    if ( cudaSuccess != cudaMemcpy(table->d_table, table->table, 64 * sizeof(uint16_t), cudaMemcpyHostToDevice) )
+    // Copy tables to device memory (the stream is synchronized before the decoder returns)
+    if ( cudaSuccess != cudaMemcpyAsync(table->d_table, table->table, 64 * sizeof(uint16_t), cudaMemcpyHostToDevice,
+                                        stream) )
         return -1;
         
     return 0;
