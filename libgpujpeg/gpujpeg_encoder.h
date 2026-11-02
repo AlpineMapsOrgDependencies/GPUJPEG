@@ -119,6 +119,15 @@ GPUJPEG_API struct gpujpeg_encoder*
 gpujpeg_encoder_create(cudaStream_t stream);
 
 /**
+ * Create JPEG encoder allocating device memory with the given allocator
+ *
+ * @param allocator  allocator (copied), NULL for the default (cudaMalloc/cudaFree); both callbacks must be set
+ * @return encoder structure if succeeds, otherwise NULL
+ */
+GPUJPEG_API struct gpujpeg_encoder*
+gpujpeg_encoder_create_with_allocator(cudaStream_t stream, const struct gpujpeg_allocator* allocator);
+
+/**
  * Compute maximum number of image pixels (width x height) which can be encoded by given memory size.
  *
  * @param encoder

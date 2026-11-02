@@ -168,6 +168,17 @@ GPUJPEG_API struct gpujpeg_decoder*
 gpujpeg_decoder_create_with_params(const struct gpujpeg_decoder_init_parameters *params);
 
 /**
+ * Create JPEG decoder allocating device memory with the given allocator
+ *
+ * @param allocator  allocator (copied), NULL for the default (cudaMalloc/cudaFree); both callbacks must be set
+ * @sa gpujpeg_decoder_create_with_params
+ * @return decoder structure if succeeds, otherwise NULL
+ */
+GPUJPEG_API struct gpujpeg_decoder*
+gpujpeg_decoder_create_with_allocator(const struct gpujpeg_decoder_init_parameters* params,
+                                      const struct gpujpeg_allocator* allocator);
+
+/**
  * Init JPEG decoder for specific image properties
  *
  * Following properties are relevant:

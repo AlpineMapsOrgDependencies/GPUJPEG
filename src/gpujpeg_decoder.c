@@ -92,10 +92,12 @@ gpujpeg_decoder_output_set_custom_cuda(struct gpujpeg_decoder_output* output, ui
     output->texture = NULL;
 }
 
-/* Documented at declaration */
-struct gpujpeg_decoder*
-gpujpeg_decoder_create(cudaStream_t stream)
+static struct gpujpeg_decoder*
+decoder_create(cudaStream_t stream, const struct gpujpeg_allocator* allocator)
 {
+    if ( !gpujpeg_allocator_is_valid(allocator) ) {
+        return NULL;
+    }
     struct gpujpeg_decoder* decoder = (struct gpujpeg_decoder*) calloc(1, sizeof(struct gpujpeg_decoder));
     if ( decoder == NULL )
         return NULL;
@@ -105,7 +107,11 @@ gpujpeg_decoder_create(cudaStream_t stream)
 
     // Initialize coder
     if ( gpujpeg_coder_init(coder) != 0 ) {
+        free(decoder);
         return NULL;
+    }
+    if ( allocator != NULL ) {
+        coder->allocator = *allocator;
     }
 
     // Set parameters
@@ -125,26 +131,27 @@ gpujpeg_decoder_create(cudaStream_t stream)
 
     // Allocate quantization tables in device memory
     for ( int comp_type = 0; comp_type < GPUJPEG_MAX_COMPONENT_COUNT; comp_type++ ) {
-        if ( cudaSuccess != cudaMalloc((void**)&decoder->table_quantization[comp_type].d_table, 64 * sizeof(uint16_t)) )
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&decoder->table_quantization[comp_type].d_table,
+                                        64 * sizeof(uint16_t)) != 0 )
             result = 0;
     }
     // Allocate huffman tables in device memory
     for ( int comp_type = 0; comp_type < GPUJPEG_MAX_COMPONENT_COUNT; comp_type++ ) {
         for ( int huff_type = 0; huff_type < GPUJPEG_HUFFMAN_TYPE_COUNT; huff_type++ ) {
-            if ( cudaSuccess != cudaMalloc((void**)&decoder->d_table_huffman[comp_type][huff_type], sizeof(struct gpujpeg_table_huffman_decoder)) )
-                result = 0;
             // gpujpeg_huffman_decoder_table_kernel() computes quick tables for 2 pair of Huffman tables, but eg. for grayscale only one pair is
             // present which causes the function potentially crash because computing from garbage values - memsetting to 0 fixes that
-            if ( cudaSuccess != cudaMemsetAsync(decoder->d_table_huffman[comp_type][huff_type], 0,
+            if ( gpujpeg_coder_device_alloc(coder, (void**)&decoder->d_table_huffman[comp_type][huff_type],
+                                            sizeof(struct gpujpeg_table_huffman_decoder)) != 0 ||
+                 cudaSuccess != cudaMemsetAsync(decoder->d_table_huffman[comp_type][huff_type], 0,
                                                 sizeof(struct gpujpeg_table_huffman_decoder), coder->stream) ) {
                 result = 0;
             }
         }
     }
-    gpujpeg_cuda_check_error("Decoder table allocation", return NULL);
+    gpujpeg_cuda_check_error("Decoder table allocation", result = 0);
 
     // Init huffman encoder
-    if ((decoder->huffman_gpu_decoder = gpujpeg_huffman_gpu_decoder_init()) == NULL) {
+    if ((decoder->huffman_gpu_decoder = gpujpeg_huffman_gpu_decoder_init(coder)) == NULL) {
         result = 0;
     }
 
@@ -154,6 +161,13 @@ gpujpeg_decoder_create(cudaStream_t stream)
     }
 
     return decoder;
+}
+
+/* Documented at declaration */
+struct gpujpeg_decoder*
+gpujpeg_decoder_create(cudaStream_t stream)
+{
+    return decoder_create(stream, NULL);
 }
 
 struct gpujpeg_decoder_init_parameters
@@ -170,7 +184,15 @@ gpujpeg_decoder_default_init_parameters()
 struct gpujpeg_decoder*
 gpujpeg_decoder_create_with_params(const struct gpujpeg_decoder_init_parameters *params)
 {
-    struct gpujpeg_decoder* decoder = gpujpeg_decoder_create(params->stream);
+    return gpujpeg_decoder_create_with_allocator(params, NULL);
+}
+
+/* Documented at declaration */
+struct gpujpeg_decoder*
+gpujpeg_decoder_create_with_allocator(const struct gpujpeg_decoder_init_parameters* params,
+                                      const struct gpujpeg_allocator* allocator)
+{
+    struct gpujpeg_decoder* decoder = decoder_create(params->stream, allocator);
     if ( decoder == NULL ) {
         return NULL;
     }
@@ -343,12 +365,12 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
         }
         coder->data_raw = NULL;
         cudaMallocHost((void**)&coder->data_raw, coder->data_raw_size * sizeof(uint8_t));
-        // (Re)allocate raw data in device memory
-        cudaFree(coder->d_data_raw_allocated);
-        coder->d_data_raw_allocated = NULL;
-        cudaMalloc((void**)&coder->d_data_raw_allocated, coder->data_raw_size * sizeof(uint8_t));
-
         gpujpeg_cuda_check_error("Decoder raw data allocation", return -1);
+        // (Re)allocate raw data in device memory
+        gpujpeg_coder_device_free(coder, coder->d_data_raw_allocated);
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_data_raw_allocated, coder->data_raw_size) != 0 ) {
+            return -1;
+        }
         coder->data_raw_allocated_size = coder->data_raw_size;
     }
 
@@ -544,19 +566,17 @@ gpujpeg_decoder_destroy(struct gpujpeg_decoder* decoder)
     }
 
     for (int comp_type = 0; comp_type < GPUJPEG_MAX_COMPONENT_COUNT; comp_type++) {
-        if (decoder->table_quantization[comp_type].d_table != NULL) {
-            cudaFree(decoder->table_quantization[comp_type].d_table);
-        }
+        gpujpeg_coder_device_free(&decoder->coder, decoder->table_quantization[comp_type].d_table);
     }
 
     for ( int comp_type = 0; comp_type < GPUJPEG_MAX_COMPONENT_COUNT; comp_type++ ) {
         for ( int huff_type = 0; huff_type < GPUJPEG_HUFFMAN_TYPE_COUNT; huff_type++ ) {
-            cudaFree(decoder->d_table_huffman[comp_type][huff_type]);
+            gpujpeg_coder_device_free(&decoder->coder, decoder->d_table_huffman[comp_type][huff_type]);
         }
     }
 
     if (decoder->huffman_gpu_decoder != NULL) {
-        gpujpeg_huffman_gpu_decoder_destroy(decoder->huffman_gpu_decoder);
+        gpujpeg_huffman_gpu_decoder_destroy(decoder->huffman_gpu_decoder, &decoder->coder);
     }
 
     free(decoder);

@@ -104,6 +104,16 @@ gpujpeg_encoder_input_texture(struct gpujpeg_opengl_texture* texture)
 struct gpujpeg_encoder*
 gpujpeg_encoder_create(cudaStream_t stream)
 {
+    return gpujpeg_encoder_create_with_allocator(stream, NULL);
+}
+
+/* Documented at declaration */
+struct gpujpeg_encoder*
+gpujpeg_encoder_create_with_allocator(cudaStream_t stream, const struct gpujpeg_allocator* allocator)
+{
+    if ( !gpujpeg_allocator_is_valid(allocator) ) {
+        return NULL;
+    }
     struct gpujpeg_encoder* encoder = (struct gpujpeg_encoder*) calloc(1, sizeof(struct gpujpeg_encoder));
     if ( encoder == NULL ) {
         return NULL;
@@ -126,17 +136,21 @@ gpujpeg_encoder_create(cudaStream_t stream)
     if ( gpujpeg_coder_init(coder) != 0 )
         result = 0;
     coder->encoder = 1;
+    if ( allocator != NULL ) {
+        coder->allocator = *allocator;
+    }
 
     // Allocate quantization tables in device memory
     for ( int comp_type = 0; comp_type < GPUJPEG_COMPONENT_TYPE_COUNT; comp_type++ ) {
-        if ( cudaSuccess != cudaMalloc((void**)&encoder->table_quantization[comp_type].d_table, 64 * sizeof(uint16_t)) ) {
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&encoder->table_quantization[comp_type].d_table,
+                                        64 * sizeof(uint16_t)) != 0 ) {
             result = 0;
         }
-        if ( cudaSuccess != cudaMalloc((void**)&encoder->table_quantization[comp_type].d_table_forward, 64 * sizeof(float)) ) {
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&encoder->table_quantization[comp_type].d_table_forward,
+                                        64 * sizeof(float)) != 0 ) {
             result = 0;
         }
     }
-    gpujpeg_cuda_check_error("Encoder table allocation", return NULL);
 
     // Init huffman tables for encoder
     for ( int comp_type = 0; comp_type < GPUJPEG_COMPONENT_TYPE_COUNT; comp_type++ ) {
@@ -145,7 +159,7 @@ gpujpeg_encoder_create(cudaStream_t stream)
                 result = 0;
         }
     }
-    gpujpeg_cuda_check_error("Encoder table init", return NULL);
+    gpujpeg_cuda_check_error("Encoder table init", result = 0);
 
     // Init huffman encoder
     encoder->huffman_gpu_encoder = gpujpeg_huffman_gpu_encoder_create(encoder);
@@ -272,12 +286,10 @@ int gpujpeg_encoder_allocate(struct gpujpeg_encoder * encoder, const struct gpuj
             coder->data_raw_allocated_size = 0;
 
             // (Re)allocate raw data in device memory
-            if (coder->d_data_raw_allocated != NULL) {
-                cudaFree(coder->d_data_raw_allocated);
-                coder->d_data_raw_allocated = NULL;
+            gpujpeg_coder_device_free(coder, coder->d_data_raw_allocated);
+            if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_data_raw_allocated, coder->data_raw_size) != 0 ) {
+                return -1;
             }
-            cudaMalloc((void**)&coder->d_data_raw_allocated, coder->data_raw_size);
-            gpujpeg_cuda_check_error("Encoder raw data allocation", return -1);
 
             coder->data_raw_allocated_size = coder->data_raw_size;
         }
@@ -406,12 +418,10 @@ gpujpeg_encoder_encode(struct gpujpeg_encoder* encoder, const struct gpujpeg_par
             coder->data_raw_allocated_size = 0;
 
             // (Re)allocate raw data in device memory
-            if (coder->d_data_raw_allocated != NULL) {
-                cudaFree(coder->d_data_raw_allocated);
-                coder->d_data_raw_allocated = NULL;
+            gpujpeg_coder_device_free(coder, coder->d_data_raw_allocated);
+            if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_data_raw_allocated, coder->data_raw_size) != 0 ) {
+                return -1;
             }
-            cudaMalloc((void**)&coder->d_data_raw_allocated, coder->data_raw_size);
-            gpujpeg_cuda_check_error("Encoder raw data allocation", return -1);
 
             coder->data_raw_allocated_size = coder->data_raw_size;
         }
@@ -438,12 +448,10 @@ gpujpeg_encoder_encode(struct gpujpeg_encoder* encoder, const struct gpujpeg_par
             coder->data_raw_allocated_size = 0;
 
             // (Re)allocate raw data in device memory
-            if (coder->d_data_raw_allocated != NULL) {
-                cudaFree(coder->d_data_raw_allocated);
-                coder->d_data_raw_allocated = NULL;
+            gpujpeg_coder_device_free(coder, coder->d_data_raw_allocated);
+            if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_data_raw_allocated, coder->data_raw_size) != 0 ) {
+                return -1;
             }
-            cudaMalloc((void**)&coder->d_data_raw_allocated, coder->data_raw_size);
-            gpujpeg_cuda_check_error("Encoder raw data allocation", return -1);
 
             coder->data_raw_allocated_size = coder->data_raw_size;
         }
@@ -804,18 +812,14 @@ gpujpeg_encoder_destroy(struct gpujpeg_encoder* encoder)
     coder_process_stats_overall(&encoder->coder);
 
     if (encoder->huffman_gpu_encoder != NULL) {
-        gpujpeg_huffman_gpu_encoder_destroy(encoder->huffman_gpu_encoder);
+        gpujpeg_huffman_gpu_encoder_destroy(encoder->huffman_gpu_encoder, &encoder->coder);
     }
     if (gpujpeg_coder_deinit(&encoder->coder) != 0) {
         return -1;
     }
     for (int comp_type = 0; comp_type < GPUJPEG_COMPONENT_TYPE_COUNT; comp_type++) {
-        if (encoder->table_quantization[comp_type].d_table != NULL) {
-            cudaFree(encoder->table_quantization[comp_type].d_table);
-        }
-        if (encoder->table_quantization[comp_type].d_table_forward != NULL) {
-            cudaFree(encoder->table_quantization[comp_type].d_table_forward);
-        }
+        gpujpeg_coder_device_free(&encoder->coder, encoder->table_quantization[comp_type].d_table);
+        gpujpeg_coder_device_free(&encoder->coder, encoder->table_quantization[comp_type].d_table_forward);
     }
     if (encoder->writer != NULL) {
         gpujpeg_writer_destroy(encoder->writer);

@@ -615,33 +615,35 @@ gpujpeg_huffman_decoder_table_kernel(
 
 /* Documented at declaration */
 struct gpujpeg_huffman_gpu_decoder *
-gpujpeg_huffman_gpu_decoder_init()
+gpujpeg_huffman_gpu_decoder_init(const struct gpujpeg_coder* coder)
 {
     struct gpujpeg_huffman_gpu_decoder *huffman_gpu_decoder = (struct gpujpeg_huffman_gpu_decoder *) calloc(1, sizeof(struct gpujpeg_huffman_gpu_decoder));
 
 #ifndef HUFFMAN_GPU_CONST_TABLES
     cudaGetSymbolAddress((void**)&huffman_gpu_decoder->d_order_natural, gpujpeg_huffman_gpu_decoder_order_natural_global);
-    gpujpeg_cuda_check_error("Huffman GPU decoder natural order table address", gpujpeg_huffman_gpu_decoder_destroy(huffman_gpu_decoder); return NULL);
+    gpujpeg_cuda_check_error("Huffman GPU decoder natural order table address", gpujpeg_huffman_gpu_decoder_destroy(huffman_gpu_decoder, coder); return NULL);
 #endif
 
-    cudaMalloc((void**)&huffman_gpu_decoder->d_tables_full, 4 * (1 << 16) * sizeof(uint16_t));
-    gpujpeg_cuda_check_error("Huffman GPU decoder full table allocation", gpujpeg_huffman_gpu_decoder_destroy(huffman_gpu_decoder); return NULL);
-
-    cudaMalloc((void**)&huffman_gpu_decoder->d_tables_quick, QUICK_TABLE_ITEMS * sizeof(uint16_t));
-    gpujpeg_cuda_check_error("Huffman GPU decoder quick table allocation", gpujpeg_huffman_gpu_decoder_destroy(huffman_gpu_decoder); return NULL);
+    if ( gpujpeg_coder_device_alloc(coder, (void**)&huffman_gpu_decoder->d_tables_full,
+                                    4 * (1 << 16) * sizeof(uint16_t)) != 0 ||
+         gpujpeg_coder_device_alloc(coder, (void**)&huffman_gpu_decoder->d_tables_quick,
+                                    QUICK_TABLE_ITEMS * sizeof(uint16_t)) != 0 ) {
+        gpujpeg_huffman_gpu_decoder_destroy(huffman_gpu_decoder, coder);
+        return NULL;
+    }
     
     return huffman_gpu_decoder;
 }
 
 void
-gpujpeg_huffman_gpu_decoder_destroy(struct gpujpeg_huffman_gpu_decoder *huffman_gpu_decoder)
+gpujpeg_huffman_gpu_decoder_destroy(struct gpujpeg_huffman_gpu_decoder *huffman_gpu_decoder, const struct gpujpeg_coder* coder)
 {
     if (huffman_gpu_decoder == NULL) {
         return;
     }
 
-    cudaFree(huffman_gpu_decoder->d_tables_full);
-    cudaFree(huffman_gpu_decoder->d_tables_quick);
+    gpujpeg_coder_device_free(coder, huffman_gpu_decoder->d_tables_full);
+    gpujpeg_coder_device_free(coder, huffman_gpu_decoder->d_tables_quick);
     free(huffman_gpu_decoder);
 }
 

@@ -52,9 +52,11 @@ gpujpeg_huffman_gpu_encoder_create(const struct gpujpeg_encoder * encoder);
  * Destroy huffman GPU encoder.
  *
  * @param huffman_gpu_encoder
+ * @param coder  coder of the encoder (allocator)
  */
 void
-gpujpeg_huffman_gpu_encoder_destroy(struct gpujpeg_huffman_gpu_encoder * huffman_gpu_encoder);
+gpujpeg_huffman_gpu_encoder_destroy(struct gpujpeg_huffman_gpu_encoder * huffman_gpu_encoder,
+                                    const struct gpujpeg_coder* coder);
 
 /**
  * Perform huffman encoding

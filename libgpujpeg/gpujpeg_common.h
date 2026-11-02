@@ -87,6 +87,20 @@ GPUJPEG_API const char *gpujpeg_version_to_string(int version);
 GPUJPEG_API double
 gpujpeg_get_time(void);
 
+/**
+ * Device memory allocator for an encoder or a decoder, see gpujpeg_encoder_create_with_allocator() and
+ * gpujpeg_decoder_create_with_allocator(). Both callbacks get the coder stream, which must stay valid until the coder
+ * is destroyed. The coder allocates on creation and when it needs bigger buffers (never in steady state). When
+ * destroying, it synchronizes its stream before freeing; no callback is called after the destroy returns.
+ */
+struct gpujpeg_allocator
+{
+    /// @returns device memory of given size usable in stream order, NULL on failure
+    void* (*device_alloc)(void* user_data, size_t size, cudaStream_t stream);
+    void (*device_free)(void* user_data, void* ptr, cudaStream_t stream);
+    void* user_data;
+};
+
 /** Maximum number of devices for get device info */
 #define GPUJPEG_MAX_DEVICE_COUNT 10
 

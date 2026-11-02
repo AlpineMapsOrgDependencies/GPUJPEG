@@ -944,9 +944,11 @@ gpujpeg_huffman_gpu_encoder_create(const struct gpujpeg_encoder * encoder)
     memset(huffman_gpu_encoder, 0, sizeof(struct gpujpeg_huffman_gpu_encoder));
 
     // Allocate the output byte count followed by the Huffman LUT
-    cudaMalloc((void**)&huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count,
-               (1 + GPUJPEG_HUFFMAN_GPU_LUT_SIZE) * sizeof(uint32_t));
-    gpujpeg_cuda_check_error("Allocation of huffman output byte count failed", return NULL);
+    if ( gpujpeg_coder_device_alloc(coder, (void**)&huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count,
+                                    (1 + GPUJPEG_HUFFMAN_GPU_LUT_SIZE) * sizeof(uint32_t)) != 0 ) {
+        free(huffman_gpu_encoder);
+        return NULL;
+    }
     huffman_gpu_encoder->d_lut = huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count + 1;
 
     // compose GPU version of the huffman LUT and copy it into GPU memory (for CC >= 2.0)
@@ -958,7 +960,9 @@ gpujpeg_huffman_gpu_encoder_create(const struct gpujpeg_encoder * encoder)
     cudaMemcpyAsync(huffman_gpu_encoder->d_lut, gpujpeg_huffman_cpu_lut, sizeof gpujpeg_huffman_cpu_lut,
                     cudaMemcpyHostToDevice, coder->stream);
     cudaStreamSynchronize(coder->stream); // the source is on the stack
-    gpujpeg_cuda_check_error("Huffman encoder init (Huffman LUT copy)", return NULL);
+    gpujpeg_cuda_check_error("Huffman encoder init (Huffman LUT copy)",
+                             gpujpeg_huffman_gpu_encoder_destroy(huffman_gpu_encoder, coder);
+                             return NULL);
 
     // Configure more shared memory for all kernels
     cudaFuncSetCacheConfig(gpujpeg_huffman_encoder_encode_kernel_warp<true>, cudaFuncCachePreferShared);
@@ -972,13 +976,11 @@ gpujpeg_huffman_gpu_encoder_create(const struct gpujpeg_encoder * encoder)
 }
 
 void
-gpujpeg_huffman_gpu_encoder_destroy(struct gpujpeg_huffman_gpu_encoder * huffman_gpu_encoder)
+gpujpeg_huffman_gpu_encoder_destroy(struct gpujpeg_huffman_gpu_encoder * huffman_gpu_encoder, const struct gpujpeg_coder* coder)
 {
     assert(huffman_gpu_encoder != NULL);
 
-    if (huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count != NULL) {
-        cudaFree(huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count);
-    }
+    gpujpeg_coder_device_free(coder, huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count);
 
     free(huffman_gpu_encoder);
 }
