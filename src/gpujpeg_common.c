@@ -583,6 +583,7 @@ gpujpeg_coder_init(struct gpujpeg_coder * coder)
     coder->d_temp_huffman = NULL;
     coder->data_compressed_allocated_size = 0;
     coder->preprocessor.chroma_filter = true;
+    coder->allocator = (struct gpujpeg_allocator){NULL, NULL, NULL};
 
     GPUJPEG_CUSTOM_TIMER_CREATE(coder->duration_memory_to, return -1);
     GPUJPEG_CUSTOM_TIMER_CREATE(coder->duration_memory_from, return -1);
@@ -657,12 +658,11 @@ gpujpeg_coder_init_image(struct gpujpeg_coder * coder, const struct gpujpeg_para
         gpujpeg_cuda_check_error("Coder color component host allocation", return 0);
 
         // (Re)allocate color components in device memory
-        if (coder->d_component != NULL) {
-            cudaFree(coder->d_component);
-            coder->d_component = NULL;
+        gpujpeg_coder_device_free(coder, coder->d_component);
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_component,
+                                        param->comp_count * sizeof(struct gpujpeg_component)) != 0 ) {
+            return 0;
         }
-        cudaMalloc((void**)&coder->d_component, param->comp_count * sizeof(struct gpujpeg_component));
-        gpujpeg_cuda_check_error("Coder color component device allocation", return 0);
 
         coder->component_allocated_size = param->comp_count;
     }
@@ -800,12 +800,11 @@ gpujpeg_coder_init_image(struct gpujpeg_coder * coder, const struct gpujpeg_para
         gpujpeg_cuda_check_error("Coder segment host allocation", return 0);
 
         // (Re)allocate segments in device memory
-        if (coder->d_segment != NULL) {
-            cudaFree(coder->d_segment);
-            coder->d_segment = NULL;
+        gpujpeg_coder_device_free(coder, coder->d_segment);
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_segment,
+                                        coder->segment_count * sizeof(struct gpujpeg_segment)) != 0 ) {
+            return 0;
         }
-        cudaMalloc((void**)&coder->d_segment, coder->segment_count * sizeof(struct gpujpeg_segment));
-        gpujpeg_cuda_check_error("Coder segment device allocation", return 0);
 
         coder->segment_allocated_size = coder->segment_count;
     }
@@ -913,12 +912,11 @@ gpujpeg_coder_init_image(struct gpujpeg_coder * coder, const struct gpujpeg_para
         coder->data_allocated_size = 0;
 
         // (Re)allocate preprocessor data in device memory
-        if (coder->d_data != NULL) {
-            cudaFree(coder->d_data);
-            coder->d_data = NULL;
+        gpujpeg_coder_device_free(coder, coder->d_data);
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_data,
+                                        (coder->data_size + idct_overhead) * sizeof(uint8_t)) != 0 ) {
+            return 0;
         }
-        cudaMalloc((void**)&coder->d_data, (coder->data_size + idct_overhead) * sizeof(uint8_t));
-        gpujpeg_cuda_check_error("Coder data device allocation", return 0);
 
         // Deallocate DCT and quantizer data in host memory, alloc just if needed
         // (gpujpeg_coder_allocate_cpu_huff_data())
@@ -928,12 +926,11 @@ gpujpeg_coder_init_image(struct gpujpeg_coder * coder, const struct gpujpeg_para
         }
 
         // (Re)allocated DCT and quantizer data in device memory
-        if (coder->d_data_quantized != NULL) {
-            cudaFree(coder->d_data_quantized);
-            coder->d_data_quantized = NULL;
+        gpujpeg_coder_device_free(coder, coder->d_data_quantized);
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_data_quantized,
+                                        (coder->data_size + idct_overhead) * sizeof(int16_t)) != 0 ) {
+            return 0;
         }
-        cudaMalloc((void**)&coder->d_data_quantized, (coder->data_size + idct_overhead) * sizeof(int16_t));
-        gpujpeg_cuda_check_error("Coder quantized data device allocation", return 0);
 
         coder->data_allocated_size = coder->data_size + idct_overhead;
     }
@@ -982,20 +979,18 @@ gpujpeg_coder_init_image(struct gpujpeg_coder * coder, const struct gpujpeg_para
         gpujpeg_cuda_check_error("Coder data compressed host registration", return 0);
 
         // (Re)allocate huffman coder data in device memory
-        if (coder->d_data_compressed != NULL) {
-            cudaFree(coder->d_data_compressed);
-            coder->d_data_compressed = NULL;
+        gpujpeg_coder_device_free(coder, coder->d_data_compressed);
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_data_compressed,
+                                        max_compressed_data_size * sizeof(uint8_t)) != 0 ) {
+            return 0;
         }
-        cudaMalloc((void**)&coder->d_data_compressed, max_compressed_data_size * sizeof(uint8_t));
-        gpujpeg_cuda_check_error("Coder data compressed device allocation", return 0);
 
         // (Re)allocate Huffman coder temporary buffer
-        if (coder->d_temp_huffman != NULL) {
-            cudaFree(coder->d_temp_huffman);
-            coder->d_temp_huffman = NULL;
+        gpujpeg_coder_device_free(coder, coder->d_temp_huffman);
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_temp_huffman,
+                                        max_compressed_data_size * sizeof(uint8_t)) != 0 ) {
+            return 0;
         }
-        cudaMalloc((void**)&coder->d_temp_huffman, max_compressed_data_size * sizeof(uint8_t));
-        gpujpeg_cuda_check_error("Huffman temp buffer device allocation", return 0);
 
         coder->data_compressed_allocated_size = max_compressed_data_size;
     }
@@ -1019,12 +1014,11 @@ gpujpeg_coder_init_image(struct gpujpeg_coder * coder, const struct gpujpeg_para
         gpujpeg_cuda_check_error("Coder block list host allocation", return 0);
 
         // (Re)allocate list of block indices in device memory
-        if (coder->d_block_list != NULL) {
-            cudaFree(coder->d_block_list);
-            coder->d_block_list = NULL;
+        gpujpeg_coder_device_free(coder, coder->d_block_list);
+        if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_block_list,
+                                        coder->block_count * sizeof(*coder->d_block_list)) != 0 ) {
+            return 0;
         }
-        cudaMalloc((void**)&coder->d_block_list, coder->block_count * sizeof(*coder->d_block_list));
-        gpujpeg_cuda_check_error("Coder block list device allocation", return 0);
 
         coder->block_allocated_size = coder->block_count;
     }
@@ -1135,34 +1129,26 @@ gpujpeg_coder_deinit(struct gpujpeg_coder* coder)
 {
     if (coder->component != NULL)
         cudaFreeHost(coder->component);
-    if (coder->d_component != NULL)
-        cudaFree(coder->d_component);
+    gpujpeg_coder_device_free(coder, coder->d_component);
     if ( coder->data_raw != NULL )
         cudaFreeHost(coder->data_raw);
-    if ( coder->d_data_raw_allocated != NULL )
-        cudaFree(coder->d_data_raw_allocated);
-    if ( coder->d_data != NULL )
-        cudaFree(coder->d_data);
+    gpujpeg_coder_device_free(coder, coder->d_data_raw_allocated);
+    gpujpeg_coder_device_free(coder, coder->d_data);
     if ( coder->data_quantized != NULL )
         cudaFreeHost(coder->data_quantized);
-    if ( coder->d_data_quantized != NULL )
-        cudaFree(coder->d_data_quantized);
+    gpujpeg_coder_device_free(coder, coder->d_data_quantized);
     if ( coder->data_compressed != NULL ) {
         cudaHostUnregister(coder->data_compressed);
         free(coder->data_compressed);
     }
-    if ( coder->d_data_compressed != NULL )
-        cudaFree(coder->d_data_compressed);
+    gpujpeg_coder_device_free(coder, coder->d_data_compressed);
     if ( coder->segment != NULL )
         cudaFreeHost(coder->segment);
-    if ( coder->d_segment != NULL )
-        cudaFree(coder->d_segment);
-    if ( coder->d_temp_huffman != NULL )
-        cudaFree(coder->d_temp_huffman);
+    gpujpeg_coder_device_free(coder, coder->d_segment);
+    gpujpeg_coder_device_free(coder, coder->d_temp_huffman);
     if ( coder->block_list != NULL )
         cudaFreeHost(coder->block_list);
-    if ( coder->d_block_list != NULL )
-        cudaFree(coder->d_block_list);
+    gpujpeg_coder_device_free(coder, coder->d_block_list);
 
     GPUJPEG_CUSTOM_TIMER_DESTROY(coder->duration_memory_to, return -1);
     GPUJPEG_CUSTOM_TIMER_DESTROY(coder->duration_memory_from, return -1);
@@ -1175,6 +1161,47 @@ gpujpeg_coder_deinit(struct gpujpeg_coder* coder)
     GPUJPEG_CUSTOM_TIMER_DESTROY(coder->duration_in_gpu, return -1);
 
     return 0;
+}
+
+int
+gpujpeg_coder_device_alloc(const struct gpujpeg_coder* coder, void** ptr, size_t size)
+{
+    if ( coder->allocator.device_alloc != NULL ) {
+        *ptr = coder->allocator.device_alloc(coder->allocator.user_data, size, coder->stream);
+    }
+    else if ( cudaMalloc(ptr, size) != cudaSuccess ) {
+        (void)cudaGetLastError(); // reported here
+        *ptr = NULL;
+    }
+    if ( *ptr == NULL ) {
+        ERROR_MSG("Cannot allocate %zu B of device memory!\n", size);
+        return -1;
+    }
+    return 0;
+}
+
+void
+gpujpeg_coder_device_free(const struct gpujpeg_coder* coder, void* ptr)
+{
+    if ( ptr == NULL ) {
+        return;
+    }
+    if ( coder->allocator.device_free != NULL ) {
+        coder->allocator.device_free(coder->allocator.user_data, ptr, coder->stream);
+    }
+    else {
+        cudaFree(ptr);
+    }
+}
+
+bool
+gpujpeg_allocator_is_valid(const struct gpujpeg_allocator* allocator)
+{
+    if ( allocator != NULL && (allocator->device_alloc == NULL) != (allocator->device_free == NULL) ) {
+        ERROR_MSG("Allocator must set both or none of device_alloc and device_free!\n");
+        return false;
+    }
+    return true;
 }
 
 /* Documented at declaration */

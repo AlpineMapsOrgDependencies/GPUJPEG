@@ -404,6 +404,8 @@ struct gpujpeg_coder
     /// Allocated size
     size_t data_compressed_allocated_size;
 
+    struct gpujpeg_allocator allocator; ///< device memory allocator (NULL callbacks for cudaMalloc/cudaFree)
+
     int cuda_cc_major; ///< CUDA Compute capability (major version)
     int cuda_cc_minor; ///< CUDA Compute capability (minor version)
 
@@ -552,6 +554,19 @@ gpujpeg_cuda_memcpy_async_partially_pinned(void* dst, const void* src, size_t co
 
 void*
 gpujpeg_cuda_malloc_host(size_t size);
+/**
+ * Allocates device memory with the coder allocator (prints an error on failure)
+ * @retval 0 on success (*ptr set), nonzero on failure (*ptr is NULL)
+ */
+int
+gpujpeg_coder_device_alloc(const struct gpujpeg_coder* coder, void** ptr, size_t size);
+/// frees device memory allocated by gpujpeg_coder_device_alloc() (ptr may be NULL)
+void
+gpujpeg_coder_device_free(const struct gpujpeg_coder* coder, void* ptr);
+/// @retval true if allocator is NULL or has both callbacks set
+bool
+gpujpeg_allocator_is_valid(const struct gpujpeg_allocator* allocator);
+
 /// @returns escape_seq if stderr is a terminal, otherwise ""
 const char*
 gpujpeg_term_color(const char* escape_seq);

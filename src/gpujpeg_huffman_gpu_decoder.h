@@ -45,10 +45,10 @@ struct gpujpeg_huffman_gpu_decoder;
  * @return 0 if succeeds, otherwise nonzero
  */
 struct gpujpeg_huffman_gpu_decoder *
-gpujpeg_huffman_gpu_decoder_init(void);
+gpujpeg_huffman_gpu_decoder_init(const struct gpujpeg_coder* coder);
 
 void
-gpujpeg_huffman_gpu_decoder_destroy(struct gpujpeg_huffman_gpu_decoder *);
+gpujpeg_huffman_gpu_decoder_destroy(struct gpujpeg_huffman_gpu_decoder *, const struct gpujpeg_coder* coder);
 
 /**
  * Perform huffman decoding
