@@ -1188,16 +1188,6 @@ gpujpeg_coder_device_free(const struct gpujpeg_coder* coder, void* ptr)
     }
 }
 
-bool
-gpujpeg_allocator_is_valid(const struct gpujpeg_allocator* allocator)
-{
-    if ( allocator != NULL && (allocator->device_alloc == NULL) != (allocator->device_free == NULL) ) {
-        ERROR_MSG("Allocator must set both or none of device_alloc and device_free!\n");
-        return false;
-    }
-    return true;
-}
-
 /* Documented at declaration */
 size_t
 gpujpeg_image_calculate_size(struct gpujpeg_image_parameters* param)
