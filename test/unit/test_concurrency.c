@@ -64,6 +64,9 @@ static int
 conc_worker_run(void* arg)
 {
     struct conc_worker* w = arg;
+    struct gpujpeg_parameters p420 = gpujpeg_default_parameters();
+    gpujpeg_parameters_chroma_subsampling(&p420, GPUJPEG_SUBSAMPLING_420);
+    gpujpeg_subsampling_get_name(p420.comp_count, p420.sampling_factor); // thread-local buffer
     cudaStream_t stream = NULL;
     if ( cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess ) {
         w->failed = true;
@@ -148,6 +151,9 @@ test_concurrency()
         fprintf(stderr, "single-threaded run failed!\n");
         abort();
     }
+    struct gpujpeg_parameters p444 = gpujpeg_default_parameters();
+    gpujpeg_parameters_chroma_subsampling(&p444, GPUJPEG_SUBSAMPLING_444);
+    const char* name = gpujpeg_subsampling_get_name(p444.comp_count, p444.sampling_factor);
     struct conc_worker workers[2] = {
         {.recreate = true,  .delay = conc_delay_supported},
         {.recreate = false, .delay = conc_delay_supported},
@@ -167,6 +173,10 @@ test_concurrency()
             fprintf(stderr, "worker %d differs from the single-threaded run!\n", i);
             abort();
         }
+    }
+    if ( strcmp(name, "4:4:4") != 0 ) { // overwritten by workers if not thread-local
+        fprintf(stderr, "subsampling name changed by another thread to %s!\n", name);
+        abort();
     }
     printf("Ok%s\n", conc_delay_supported ? "" : " (without stream delays)");
 }
