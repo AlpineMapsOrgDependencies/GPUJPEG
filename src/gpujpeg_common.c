@@ -65,10 +65,12 @@
     #include <cuda_gl_interop.h>
 #endif
 
-#if _STDC_VERSION__ >= 201112L
-#include <threads.h>
-#elif __cplusplus < 201103L
-#define thread_local
+#if __STDC_VERSION__ >= 202311L
+// thread_local is a keyword
+#elif __STDC_VERSION__ >= 201112L
+#define thread_local _Thread_local
+#elif defined _MSC_VER
+#define thread_local __declspec(thread)
 #endif
 
 // rounds number of segment bytes up to next multiple of 128
@@ -78,19 +80,13 @@
     /* Documented at declaration */
     double gpujpeg_get_time()
     {
-        static double frequency = 0.0;
-        static LARGE_INTEGER frequencyAsInt;
+        LARGE_INTEGER frequency;
         LARGE_INTEGER timer;
-        if (frequency == 0.0) {
-            if (!QueryPerformanceFrequency(&frequencyAsInt)) {
-                return -1.0;
-            }
-            else {
-                frequency = (double)frequencyAsInt.QuadPart;
-            }
+        if (!QueryPerformanceFrequency(&frequency)) {
+            return -1.0;
         }
         QueryPerformanceCounter(&timer);
-        return (double) timer.QuadPart / frequency;
+        return (double) timer.QuadPart / (double) frequency.QuadPart;
     }
 #elif defined(__linux__) || defined(__APPLE__)
     #include <sys/time.h>
