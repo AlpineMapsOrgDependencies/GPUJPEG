@@ -398,7 +398,9 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
         GPUJPEG_CUSTOM_TIMER_START(coder->duration_memory_from, coder->param.perf_stats, coder->stream, return -1);
 
         // Copy decompressed image to host memory
-        cudaMemcpy(coder->data_raw, coder->d_data_raw, coder->data_raw_size * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(coder->data_raw, coder->d_data_raw, coder->data_raw_size * sizeof(uint8_t),
+                        cudaMemcpyDeviceToHost, coder->stream);
+        cudaStreamSynchronize(coder->stream);
 
         GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_memory_from, coder->param.perf_stats, coder->stream, return -1);
 
@@ -413,7 +415,9 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
         // subtract width padding if user buffer hasn't allocated padding for the last line (unlikely)
         size_t data_raw_size = coder->data_raw_size - coder->param_image.width_padding;
         // Copy decompressed image to host memory
-        cudaMemcpy(output->data, coder->d_data_raw, data_raw_size * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(output->data, coder->d_data_raw, data_raw_size * sizeof(uint8_t), cudaMemcpyDeviceToHost,
+                        coder->stream);
+        cudaStreamSynchronize(coder->stream);
 
         GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_memory_from, coder->param.perf_stats, coder->stream, return -1);
     }
