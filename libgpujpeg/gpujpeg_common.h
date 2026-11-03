@@ -90,8 +90,10 @@ gpujpeg_get_time(void);
 /**
  * Device memory allocator for an encoder or a decoder, see gpujpeg_encoder_create_with_allocator() and
  * gpujpeg_decoder_create_with_allocator(). Both callbacks get the coder stream, which must stay valid until the coder
- * is destroyed. The coder allocates on creation and when it needs bigger buffers (never in steady state). When
- * destroying, it synchronizes its stream before freeing; no callback is called after the destroy returns.
+ * is destroyed. The coder allocates on creation and when it needs bigger buffers (never in steady state). Destroying
+ * synchronizes the stream, then frees; no callback is called after it returns (user_data must stay valid until then,
+ * stream-ordered frees may still be pending). device_free cannot report errors to the coder.
+ * If encoding/decoding fails (eg. an allocation), the coder must be destroyed, it cannot be used again.
  */
 struct gpujpeg_allocator
 {
