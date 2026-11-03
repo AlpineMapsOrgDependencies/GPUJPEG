@@ -9,7 +9,7 @@ option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 option(CMAKE_CUDA_ARCHITECTURES "CUDA architectures to build for (needs CMake 3.18)" OFF)
 option(ENABLE_FPNGE "Enable fpnge - requires c++ and sse4" OFF)
 option(USE_NATIVE_CPU_ARCH "Use -march=native for compilation (Linux only)" OFF)
-option(HUFFMAN_GPU_CONST_TABLES "Enable Huffman GPU decoder quick const tables" OFF)
+option(HUFFMAN_GPU_CONST_TABLES "Enable Huffman GPU decoder quick const tables (not for concurrent decoders)" OFF)
 set(OPENGL_CONTEXT AUTO CACHE STRING "Use specifiedn OpenGL context creation, options are: AUTO GLX GLFW NONE")
 set_property(CACHE OPENGL_CONTEXT PROPERTY STRINGS AUTO GLX GLFW NONE)
 
