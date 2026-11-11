@@ -100,6 +100,10 @@ test_concurrency();
 void
 test_allocator();
 
+// defined in test_huffman_resync.c
+void
+test_huffman_resync();
+
 static char*
 test_format_number_with_delim() {
         struct {
@@ -147,6 +151,7 @@ int main() {
         test_chroma_filter();
         test_concurrency();
         test_allocator();
+        test_huffman_resync();
         printf("PASSED\n");
 }
 

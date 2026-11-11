@@ -123,6 +123,9 @@ decoder_create(cudaStream_t stream, const struct gpujpeg_allocator* allocator)
     coder->param.restart_interval = 0;
     decoder->req_pixel_format = GPUJPEG_PIXFMT_AUTODETECT;
     decoder->req_color_space = GPUJPEG_CS_DEFAULT;
+    decoder->resync_param = (struct gpujpeg_huffman_gpu_resync_param){
+        GPUJPEG_HUFFMAN_GPU_RESYNC_CHUNK_BYTES, GPUJPEG_HUFFMAN_GPU_RESYNC_SEQ_CHUNKS,
+        GPUJPEG_HUFFMAN_GPU_RESYNC_REPAIR_ROUNDS, GPUJPEG_HUFFMAN_GPU_RESYNC_MIN_BYTES};
 
     int result = 1;
 
@@ -254,6 +257,37 @@ gpujpeg_decoder_init(struct gpujpeg_decoder* decoder, const struct gpujpeg_param
     return 0;
 }
 
+/**
+ * Huffman decoding on CPU and upload of all quantized coefficients (replacing any previous device content)
+ *
+ * @return 0 if succeeds, otherwise nonzero
+ */
+static int
+decode_huffman_cpu(struct gpujpeg_decoder* decoder)
+{
+    struct gpujpeg_coder* coder = &decoder->coder;
+
+    GPUJPEG_CUSTOM_TIMER_START(coder->duration_huffman_coder, coder->param.perf_stats, coder->stream, return -1);
+    if (coder->data_quantized == NULL) {
+        if (gpujpeg_coder_allocate_cpu_huffman_buf(coder) != 0) {
+            return -1;
+        }
+    }
+    if (0 != gpujpeg_huffman_cpu_decoder_decode(decoder)) {
+        fprintf(stderr, "[GPUJPEG] [Error] Huffman decoder failed!\n");
+        return -1;
+    }
+    GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_huffman_coder, coder->param.perf_stats, coder->stream, return -1);
+
+    // Copy quantized data to device memory from cpu memory
+    GPUJPEG_CUSTOM_TIMER_START(coder->duration_memory_to, coder->param.perf_stats, coder->stream, return -1);
+    cudaMemcpyAsync(coder->d_data_quantized, coder->data_quantized, coder->data_size * sizeof(int16_t),
+                    cudaMemcpyHostToDevice, coder->stream);
+    GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_memory_to, coder->param.perf_stats, coder->stream, return -1);
+
+    return 0;
+}
+
 /* Documented at declaration */
 int
 gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t image_size, struct gpujpeg_decoder_output* output)
@@ -289,31 +323,26 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
         }
     }
 
-    if ( coder->segment_count < 32 ) { // the CPU Huffman implementation will be likely faster
+    // a single segment without restart markers may be decoded on GPU by self-synchronization
+    const bool resync = !use_cpu_huffman_decoder && gpujpeg_huffman_gpu_decoder_resync_possible(decoder);
+    if ( resync ) {
+        VERBOSE_MSG(decoder->coder.param.verbose, "Huffman has no restart markers. Using GPU decoder with "
+                                                  "resynchronization.\n");
+    }
+    else if ( coder->segment_count < 32 ) { // the CPU Huffman implementation will be likely faster
         VERBOSE_MSG(decoder->coder.param.verbose, "Huffman has only %d segments. Using CPU decoder, which is slower!\n",
                     coder->segment_count);
         use_cpu_huffman_decoder = true;
     }
+    decoder->huffman_route = use_cpu_huffman_decoder ? GPUJPEG_HUFFMAN_ROUTE_CPU
+                             : resync                ? GPUJPEG_HUFFMAN_ROUTE_RESYNC
+                                                     : GPUJPEG_HUFFMAN_ROUTE_GPU;
 
     // Perform huffman decoding on CPU (when there are not enough segments to saturate GPU)
     if ( use_cpu_huffman_decoder ) {
-        GPUJPEG_CUSTOM_TIMER_START(coder->duration_huffman_coder, coder->param.perf_stats, coder->stream, return -1);
-        if (coder->data_quantized == NULL) {
-            if (gpujpeg_coder_allocate_cpu_huffman_buf(coder) != 0) {
-                return -1;
-            }
-        }
-        if (0 != gpujpeg_huffman_cpu_decoder_decode(decoder)) {
-            fprintf(stderr, "[GPUJPEG] [Error] Huffman decoder failed!\n");
+        if ( decode_huffman_cpu(decoder) != 0 ) {
             return -1;
         }
-        GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_huffman_coder, coder->param.perf_stats, coder->stream, return -1);
-
-        // Copy quantized data to device memory from cpu memory
-        GPUJPEG_CUSTOM_TIMER_START(coder->duration_memory_to, coder->param.perf_stats, coder->stream, return -1);
-        cudaMemcpyAsync(coder->d_data_quantized, coder->data_quantized, coder->data_size * sizeof(int16_t),
-                        cudaMemcpyHostToDevice, coder->stream);
-        GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_memory_to, coder->param.perf_stats, coder->stream, return -1);
 
         GPUJPEG_CUSTOM_TIMER_START(coder->duration_in_gpu, coder->param.perf_stats, coder->stream, return -1);
     }
@@ -340,11 +369,22 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
         GPUJPEG_CUSTOM_TIMER_START(coder->duration_in_gpu, coder->param.perf_stats, coder->stream, return -1);
         GPUJPEG_CUSTOM_TIMER_START(coder->duration_huffman_coder, coder->param.perf_stats, coder->stream, return -1);
         // Perform huffman decoding
-        if (0 != gpujpeg_huffman_gpu_decoder_decode(decoder)) {
+        rc = resync ? gpujpeg_huffman_gpu_decoder_resync_decode(decoder) : gpujpeg_huffman_gpu_decoder_decode(decoder);
+        if ( rc < 0 ) {
             fprintf(stderr, "[GPUJPEG] [Error] Huffman decoder on GPU failed!\n");
             return -1;
         }
         GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_huffman_coder, coder->param.perf_stats, coder->stream, return -1);
+        // not certified (eg. not synchronized), the CPU result replaces all coefficients (timers then show the CPU)
+        if ( rc > 0 ) {
+            VERBOSE_MSG(decoder->coder.param.verbose,
+                        "Huffman GPU resynchronization failed (status 0x%x). Decoding again on CPU.\n",
+                        decoder->huffman_resync_status);
+            decoder->huffman_route = GPUJPEG_HUFFMAN_ROUTE_RESYNC_RETRY;
+            if ( decode_huffman_cpu(decoder) != 0 ) {
+                return -1;
+            }
+        }
     }
 
     GPUJPEG_CUSTOM_TIMER_START(coder->duration_dct_quantization, coder->param.perf_stats, coder->stream, return -1);

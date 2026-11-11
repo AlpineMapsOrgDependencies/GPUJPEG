@@ -38,8 +38,9 @@ For the _encoder_, the restart interval is given as a member variable
 `restart_interval` of `struct gpujpeg_parameters`. Higher value result
 in smaller JPEG images but slower encoding. Good values are between 8
 (default set by gpujpeg_set_default_parameters()) or 16. Disabling restart
-intervals (setting value to 0) causes that the Huffman encoding/decoding
-is done on CPU (while the rest is still performed by GPU). On larger
+intervals (setting value to 0) moves Huffman encoding to the CPU. Eligible
+JPEGs without restart markers can still use GPU Huffman decoding, as
+described below. On larger
 images, the restart interval can be a bit larger because there are more
 MCUs. _gpujpegtool_ provides _-r_ option (if not set, a eligible
 runtime-determined value is used).
@@ -58,6 +59,17 @@ command:
 
 The values in the order of magnitude in hundreds or thousands mean that the number
 of segments should not be a problem.
+
+For JPEGs without restart markers, the decoder can use GPU Huffman
+resynchronization on 8-bit baseline images with one sequential scan:
+grayscale, or interleaved 4:4:4, 4:2:2 and 4:2:0. The default minimum is
+256 KiB of entropy-coded scan data; smaller scans retain CPU Huffman
+decoding to avoid GPU setup overhead. Scans larger than 64 MiB also retain
+CPU Huffman decoding under the default resource limits. Other layout/table
+restrictions also apply. If bounded resynchronization or output validation
+fails, the decoder retries Huffman decoding on the CPU before reconstruction.
+Restart-marker decoding retains its existing path. Use verbose output
+to see whether resynchronization was selected and whether it retried.
 
 You can also benchmark and find the potential bottleneck by running:
 

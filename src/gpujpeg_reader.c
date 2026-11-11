@@ -96,6 +96,12 @@ struct gpujpeg_reader
     bool in_spiff;
     struct gpujpeg_image_metadata *metadata;
     const char *comment;
+
+    // facts for gpujpeg_decoder::huffman_resync_eligible
+    int sof_count;            ///< SOF0/SOF1 marker count
+    bool sof1;                ///< SOF1 (extended sequential) read
+    unsigned huffman_defined; ///< DC/AC tables 0 and 1 defined by this image (bit table index * 2 + class)
+    bool resync_scan;         ///< first scan eligible (cleared by a DHT after it)
 };
 
 /**
@@ -915,10 +921,11 @@ huff_table_dump(int Th, int Tc, const struct gpujpeg_table_huffman_decoder* tabl
  *
  * @param decoder
  * @param image
+ * @param[in,out] defined  DC/AC tables 0 and 1 defined so far (bit table index * 2 + class)
  * @return 0 if succeeds, otherwise nonzero
  */
 static int
-gpujpeg_reader_read_dht(struct gpujpeg_decoder* decoder, uint8_t** image, const uint8_t* image_end)
+gpujpeg_reader_read_dht(struct gpujpeg_decoder* decoder, uint8_t** image, const uint8_t* image_end, unsigned* defined)
 {
     if(image_end - *image < 2) {
         fprintf(stderr, "[GPUJPEG] [Error] Could not read DHT size (end of data)\n");
@@ -973,6 +980,9 @@ gpujpeg_reader_read_dht(struct gpujpeg_decoder* decoder, uint8_t** image, const 
         }
         // Compute huffman table for read values
         gpujpeg_table_huffman_decoder_compute(table);
+        if ( Th <= 1 ) {
+            *defined |= 1U << (Th * 2 + Tc);
+        }
 
         if (decoder->coder.param.verbose >= GPUJPEG_LL_DEBUG2) {
             huff_table_dump(Th, Tc, table);
@@ -1312,6 +1322,7 @@ gpujpeg_reader_read_sos(struct gpujpeg_decoder* decoder, struct gpujpeg_reader* 
     }
 
     // Collect the component-spec parameters
+    bool resync_scan = reader->scan_count == 0 && comp_count == reader->param.comp_count;
     for ( int comp = 0; comp < comp_count; comp++ )
     {
         int comp_id = (int)gpujpeg_reader_read_byte(*image);
@@ -1333,6 +1344,10 @@ gpujpeg_reader_read_sos(struct gpujpeg_decoder* decoder, struct gpujpeg_reader* 
 
         decoder->comp_table_huffman_map[component_index][GPUJPEG_HUFFMAN_DC] = table_dc;
         decoder->comp_table_huffman_map[component_index][GPUJPEG_HUFFMAN_AC] = table_ac;
+        // components in SOF order, tables defined by this image before the scan
+        resync_scan = resync_scan && component_index == comp && table_dc <= 1 && table_ac <= 1 &&
+                      (reader->huffman_defined >> (table_dc * 2 + GPUJPEG_HUFFMAN_DC) & 1U) != 0 &&
+                      (reader->huffman_defined >> (table_ac * 2 + GPUJPEG_HUFFMAN_AC) & 1U) != 0;
 
         if ( decoder->coder.param.verbose >= GPUJPEG_LL_DEBUG2 ) {
             printf("SOS component #%d table DC: %d table AC: %d\n", comp_id, table_dc, table_ac);
@@ -1374,8 +1389,13 @@ gpujpeg_reader_read_sos(struct gpujpeg_decoder* decoder, struct gpujpeg_reader* 
             return -1;
     } else {
         // Read scan content byte-by-byte
+        const uint8_t* const scan_begin = *image;
         if ( gpujpeg_reader_read_scan_content_by_parsing(decoder, reader, image, image_end, scan, scan_index) != 0 )
             return -1;
+        // sequential SOF0 scan copied as one segment without restart markers or skipped bytes
+        reader->resync_scan = resync_scan && reader->sof_count == 1 && !reader->sof1 && Ss == 0 && Se == 63 &&
+                              Ax == 0 && reader->param.restart_interval == 0 && scan->segment_count == 1 &&
+                              reader->data_compressed_size == (size_t)(*image - scan_begin);
     }
 
     return 0;
@@ -1630,6 +1650,7 @@ gpujpeg_reader_read_image(struct gpujpeg_decoder* decoder, uint8_t* image, size_
     reader.param.restart_interval = 0;
     reader.param_image.pixel_format = decoder->req_pixel_format;
     reader.param_image.color_space = decoder->req_color_space;
+    decoder->huffman_resync_eligible = false;
     for (unsigned i = 0; i < GPUJPEG_METADATA_COUNT; ++i) {
         decoder->metadata.vals[i].set = false;
     }
@@ -1670,8 +1691,10 @@ gpujpeg_reader_read_image(struct gpujpeg_decoder* decoder, uint8_t* image, size_
 
         case GPUJPEG_MARKER_SOF1: // Extended sequential with Huffman coder
             fprintf(stderr, "[GPUJPEG] [Warning] Reading SOF1 as it was SOF0 marker (should work but verify it)!\n");
+            reader.sof1 = true;
             /* fall through */
         case GPUJPEG_MARKER_SOF0: // Baseline
+            reader.sof_count += 1;
             if (reader.header_color_space != GPUJPEG_NONE) {
                 reader.param.color_space_internal = reader.header_color_space;
             }
@@ -1685,8 +1708,9 @@ gpujpeg_reader_read_image(struct gpujpeg_decoder* decoder, uint8_t* image, size_
             break;
 
         case GPUJPEG_MARKER_DHT:
-            if ( gpujpeg_reader_read_dht(decoder, &image, reader.image_end) != 0 )
+            if ( gpujpeg_reader_read_dht(decoder, &image, reader.image_end, &reader.huffman_defined) != 0 )
                 return -1;
+            reader.resync_scan = reader.resync_scan && reader.scan_count == 0;
             break;
 
         case GPUJPEG_MARKER_SOS:
@@ -1725,6 +1749,9 @@ gpujpeg_reader_read_image(struct gpujpeg_decoder* decoder, uint8_t* image, size_
     // Set decoder parameters
     decoder->segment_count = reader.segment_count;
     decoder->data_compressed_size = reader.data_compressed_size;
+    decoder->huffman_resync_eligible = reader.resync_scan && reader.scan_count == 1 && reader.sof_count == 1 &&
+                                       reader.param.restart_interval == 0 &&
+                                       reader.segment_count == decoder->coder.segment_count;
 
     if ( decoder->segment_count > decoder->coder.segment_count ) {
         fprintf(stderr, "[GPUJPEG] [Error] Decoder can't decode image that has segment count %d (maximum segment count for specified parameters is %d)!\n",

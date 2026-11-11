@@ -37,6 +37,26 @@
 #include "gpujpeg_common_internal.h"
 #include "gpujpeg_table.h"
 
+/// Huffman decoder used for the last image (unit-test diagnostics)
+enum gpujpeg_huffman_route {
+    GPUJPEG_HUFFMAN_ROUTE_CPU,          ///< CPU (few segments or unsupported tables)
+    GPUJPEG_HUFFMAN_ROUTE_GPU,          ///< GPU, one thread per segment
+    GPUJPEG_HUFFMAN_ROUTE_RESYNC,       ///< GPU without restart markers (self-synchronization)
+    GPUJPEG_HUFFMAN_ROUTE_RESYNC_RETRY, ///< GPU without restart markers failed, decoded again on CPU
+};
+
+/**
+ * Private limits of the GPU Huffman decoder without restart markers (gpujpeg_huffman_gpu_decoder_resync_decode()),
+ * set from compile-time defaults on decoder creation; unit tests use small values to cover chunk and repair limits.
+ */
+struct gpujpeg_huffman_gpu_resync_param
+{
+    int chunk_bytes;   ///< entropy-coded (stuffed) bytes per chunk
+    int seq_chunks;    ///< chunks repaired together by one thread block (at most 1024)
+    int repair_rounds; ///< chunks each sequence repair may walk (exhaustion retries on CPU)
+    size_t min_bytes;  ///< smaller scans keep the CPU decoder
+};
+
 /**
  * JPEG decoder structure
  */
@@ -64,6 +84,13 @@ struct gpujpeg_decoder
     
     /// Current data compressed size for decoded image
     size_t data_compressed_size;
+
+    /// set by the reader for each image: the only scan is a complete sequential SOF0 scan of all components in
+    /// SOF order without restart markers, using Huffman tables defined by this image
+    bool huffman_resync_eligible;
+    struct gpujpeg_huffman_gpu_resync_param resync_param;
+    enum gpujpeg_huffman_route huffman_route;
+    unsigned huffman_resync_status; ///< status bits of the last GPU decoding attempt without restart markers
 
     enum gpujpeg_pixel_format req_pixel_format;
     enum gpujpeg_color_space req_color_space;

@@ -8,10 +8,13 @@
 #include <string.h>
 #include <threads.h>
 
+#include "../../src/gpujpeg_decoder_internal.h"
+
 /*
  * Coders in separate threads, each with an own non-blocking stream, must produce the same results as a single coder.
  * Streams are delayed before each call (host function) so that queued work lags behind the host; quality (thus
- * quantization tables) changes each iteration, size once (buffer growth) and one worker recreates its coders.
+ * quantization tables) changes each iteration, size once (buffer growth) and one worker recreates its coders. Every
+ * third iteration has a single scan without restart markers (GPU decoder with resynchronization).
  */
 
 enum {
@@ -58,6 +61,9 @@ conc_create(struct conc_worker* w, cudaStream_t stream, struct gpujpeg_encoder**
     *encoder = gpujpeg_encoder_create(stream);
     *decoder = gpujpeg_decoder_create_with_params(&param);
     w->failed |= *encoder == NULL || *decoder == NULL;
+    if ( *decoder != NULL ) {
+        (*decoder)->resync_param.min_bytes = 0;
+    }
 }
 
 static int
@@ -91,6 +97,10 @@ conc_worker_run(void* arg)
         struct gpujpeg_parameters param = gpujpeg_default_parameters();
         param.verbose = GPUJPEG_LL_QUIET;
         param.quality = it % 2 == 0 ? 90 : 60;
+        if ( it % 3 == 1 ) {
+            param.interleaved = 1;
+            param.restart_interval = 0;
+        }
         struct gpujpeg_image_parameters param_image = gpujpeg_default_image_parameters();
         param_image.width = param_image.height = it < CONC_ITERS / 2 ? CONC_MAX_SIZE / 2 : CONC_MAX_SIZE;
         struct gpujpeg_encoder_input input = gpujpeg_encoder_input_image(conc_image);
@@ -110,6 +120,12 @@ conc_worker_run(void* arg)
         struct gpujpeg_decoder_output output;
         gpujpeg_decoder_output_set_default(&output);
         if ( gpujpeg_decoder_decode(decoder, jpeg, jpeg_len, &output) != 0 ) {
+            w->failed = true;
+            break;
+        }
+        if ( it % 3 == 1 && decoder->huffman_route != GPUJPEG_HUFFMAN_ROUTE_RESYNC ) {
+            fprintf(stderr, "iteration %d: expected GPU resynchronization, got route %d (status 0x%x)!\n", it,
+                    (int)decoder->huffman_route, decoder->huffman_resync_status);
             w->failed = true;
             break;
         }

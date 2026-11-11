@@ -39,6 +39,32 @@ extern "C" {
 
 struct gpujpeg_huffman_gpu_decoder;
 
+// defaults of gpujpeg_decoder::resync_param (decoding without restart markers)
+#ifndef GPUJPEG_HUFFMAN_GPU_RESYNC_CHUNK_BYTES
+    #define GPUJPEG_HUFFMAN_GPU_RESYNC_CHUNK_BYTES 512
+#endif
+#ifndef GPUJPEG_HUFFMAN_GPU_RESYNC_SEQ_CHUNKS
+    #define GPUJPEG_HUFFMAN_GPU_RESYNC_SEQ_CHUNKS 128
+#endif
+#ifndef GPUJPEG_HUFFMAN_GPU_RESYNC_REPAIR_ROUNDS
+    #define GPUJPEG_HUFFMAN_GPU_RESYNC_REPAIR_ROUNDS 128
+#endif
+#ifndef GPUJPEG_HUFFMAN_GPU_RESYNC_MIN_BYTES
+    #define GPUJPEG_HUFFMAN_GPU_RESYNC_MIN_BYTES 262144
+#endif
+
+/// gpujpeg_decoder::huffman_resync_status bits (reasons to decode the image again on CPU)
+enum gpujpeg_huffman_gpu_resync_status_bits {
+    GPUJPEG_HUFFMAN_RESYNC_REPAIR_LIMIT = 1 << 0, ///< chunk repair rounds exhausted
+    GPUJPEG_HUFFMAN_RESYNC_ORDER = 1 << 1,        ///< block prefixes not anchored at 0 or not monotone
+    GPUJPEG_HUFFMAN_RESYNC_START = 1 << 2,        ///< invalid chunk start state, position or MCU phase
+    GPUJPEG_HUFFMAN_RESYNC_DECODE = 1 << 3,       ///< invalid code, run or DC predictor, or data overrun
+    GPUJPEG_HUFFMAN_RESYNC_OWNERSHIP = 1 << 4,    ///< replayed block starting after its chunk
+    GPUJPEG_HUFFMAN_RESYNC_ENDPOINT = 1 << 5,     ///< replay ended elsewhere than the chunk record
+    GPUJPEG_HUFFMAN_RESYNC_PADDING = 1 << 6,      ///< more than up to 7 one bits after the last block
+    GPUJPEG_HUFFMAN_RESYNC_INCOMPLETE = 1 << 7,   ///< not exactly one chunk completed the scan
+};
+
 /**
  * Init huffman decoder
  * 
@@ -58,6 +84,27 @@ gpujpeg_huffman_gpu_decoder_destroy(struct gpujpeg_huffman_gpu_decoder *, const 
  */
 int
 gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder);
+
+/**
+ * Checks if the image (parsed, before the copy to device) can be Huffman decoded on GPU without restart markers:
+ * reader eligibility (gpujpeg_decoder::huffman_resync_eligible), grayscale 1x1 or interleaved 4:4:4, 4:2:2 or 4:2:0,
+ * table selectors, baseline Huffman tables, size and resource limits (gpujpeg_decoder::resync_param)
+ */
+bool
+gpujpeg_huffman_gpu_decoder_resync_possible(const struct gpujpeg_decoder* decoder);
+
+/**
+ * Huffman decoding of a scan without restart markers by self-synchronization (speculative chunk decoding, repair,
+ * prefix scan and certified replay into coder->d_data_quantized), using coder->d_temp_huffman as scratch. Waits for
+ * the result; on failure, gpujpeg_decoder::huffman_resync_status has the reason and the coefficients are incomplete.
+ *
+ * @pre gpujpeg_huffman_gpu_decoder_resync_possible(), compressed data and zeroed coefficients queued in coder stream
+ * @retval 0 success
+ * @retval 1 not decoded, decode on CPU instead
+ * @retval -1 CUDA error or unmet precondition
+ */
+int
+gpujpeg_huffman_gpu_decoder_resync_decode(struct gpujpeg_decoder* decoder);
 
 #ifdef __cplusplus
 }

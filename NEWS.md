@@ -1,6 +1,9 @@
 unreleased
 ----------
 
+- add GPU Huffman resynchronization for eligible single-scan baseline JPEGs
+without restart markers, with bounded CPU fallback and a 256 KiB scan cutoff
+
 - the encoder averages subsampled chroma (was point sampling) and the
 decoder interpolates 4:2:0, 4:2:2 and 4:4:0 chroma like libjpeg for
 full-resolution output (was replicated; also for chroma <= 2 samples wide,

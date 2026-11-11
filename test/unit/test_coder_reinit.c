@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../../src/gpujpeg_decoder_internal.h"
+
 /*
  * Reuse one encoder and one decoder across JPEG layout and output format
  * changes and compare every result with freshly created coders.
@@ -54,7 +56,11 @@ reinit_decoder_create(void)
 {
     struct gpujpeg_decoder_init_parameters param = gpujpeg_decoder_default_init_parameters();
     param.verbose = GPUJPEG_LL_QUIET;
-    return gpujpeg_decoder_create_with_params(&param);
+    struct gpujpeg_decoder* decoder = gpujpeg_decoder_create_with_params(&param);
+    if ( decoder != NULL ) {
+        decoder->resync_param.min_bytes = 0; // route assertions below require successful GPU resynchronization
+    }
+    return decoder;
 }
 
 static void
@@ -82,11 +88,14 @@ test_coder_reinit()
         image[i] = (uint8_t)(i / 3 % REINIT_W + i / (3 * REINIT_W) * 2 + ((i * 2654435761U) >> 28));
     }
     const struct reinit_step steps[] = {
-        {GPUJPEG_SUBSAMPLING_444, 8, GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false}, // GPU Huffman coder
-        {GPUJPEG_SUBSAMPLING_420, 0, GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false}, // encoder subsampling change
-        {GPUJPEG_SUBSAMPLING_444, 0, GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false}, // CPU Huffman buffer growth
-        {GPUJPEG_SUBSAMPLING_420, 8, GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false},
-        {GPUJPEG_SUBSAMPLING_420, 8, GPUJPEG_YCBCR_JPEG, GPUJPEG_420_U8_P0P1P2, true }, // output format change only
+        {GPUJPEG_SUBSAMPLING_444, 8,   GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false}, // GPU Huffman coder
+        // encoder subsampling change; CPU Huffman encoder, GPU decoder without restart markers
+        {GPUJPEG_SUBSAMPLING_420, 0,   GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false},
+        {GPUJPEG_SUBSAMPLING_444, 0,   GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false}, // CPU Huffman buffer growth
+        {GPUJPEG_SUBSAMPLING_420, 128, GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false}, // CPU Huffman decoder
+        {GPUJPEG_SUBSAMPLING_444, 128, GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false}, // its buffer growth
+        {GPUJPEG_SUBSAMPLING_420, 8,   GPUJPEG_RGB,        GPUJPEG_444_U8_P012,   false},
+        {GPUJPEG_SUBSAMPLING_420, 8,   GPUJPEG_YCBCR_JPEG, GPUJPEG_420_U8_P0P1P2, true }, // output format change only
     };
     struct gpujpeg_encoder* encoder = gpujpeg_encoder_create(0);
     struct gpujpeg_decoder* decoder = reinit_decoder_create();
@@ -113,6 +122,11 @@ test_coder_reinit()
         reinit_check(reinit_decode(decoder, jpeg, jpeg_len, step, &out) == 0 && out.data_size == fresh_out.data_size &&
                          memcmp(out.data, fresh_out.data, out.data_size) == 0,
                      i, "decoder");
+        const enum gpujpeg_huffman_route expected_route = step->restart_interval == 0     ? GPUJPEG_HUFFMAN_ROUTE_RESYNC
+                                                          : step->restart_interval == 128 ? GPUJPEG_HUFFMAN_ROUTE_CPU
+                                                                                          : GPUJPEG_HUFFMAN_ROUTE_GPU;
+        reinit_check(fresh->huffman_route == expected_route, i, "decoder route (fresh)");
+        reinit_check(decoder->huffman_route == expected_route, i, "decoder route");
         gpujpeg_decoder_destroy(fresh);
     }
     gpujpeg_decoder_destroy(decoder);

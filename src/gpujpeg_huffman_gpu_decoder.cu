@@ -277,9 +277,13 @@ gpujpeg_huffman_gpu_decoder_value_from_category(int nbits, int code)
 //     return (code < half[nbits]) ? (code + start[nbits]) : code;    
 }
 
+/// coefficient index after an invalid code in checked decoding (beyond the block, not an end of block)
+#define GPUJPEG_HUFFMAN_GPU_INVALID_COEFFICIENT_IDX 0x1000
+
 /**
  * Decodes next coefficient, updating its output index
  * 
+ * @tparam CHECKED  invalid code sets the index to GPUJPEG_HUFFMAN_GPU_INVALID_COEFFICIENT_IDX (without consuming it)
  * @param table
  * @param get_bits
  * @param get_buff
@@ -287,6 +291,7 @@ gpujpeg_huffman_gpu_decoder_value_from_category(int nbits, int code)
  * @param data_size
  * @return int
  */
+template <bool CHECKED = false>
 __device__ inline int
 gpujpeg_huffman_gpu_decoder_get_coefficient(struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
                 unsigned int & r_bit, unsigned int & r_bit_count, uint4* const s_byte,
@@ -305,6 +310,12 @@ gpujpeg_huffman_gpu_decoder_get_coefficient(struct gpujpeg_huffman_gpu_decoder h
         packed_info = huffman_gpu_decoder.d_tables_full[table_idx];
     }
     
+    // invalid codes have zero length (the unchecked decoding treats them as an end of block)
+    if ( CHECKED && ((packed_info >> 4) & 0x1F) == 0 ) {
+        coefficient_idx = GPUJPEG_HUFFMAN_GPU_INVALID_COEFFICIENT_IDX;
+        return 0;
+    }
+
     // remove the right number of bits from the bit buffer
     gpujpeg_huffman_gpu_decoder_discard_bits((packed_info >> 4) & 0x1F, r_bit, r_bit_count);
     
@@ -322,8 +333,13 @@ gpujpeg_huffman_gpu_decoder_get_coefficient(struct gpujpeg_huffman_gpu_decoder h
 /**
  * Decode one 8x8 block
  *
+ * @tparam WRITE    store the coefficients (data_output unused otherwise)
+ * @tparam CHECKED  fail on an invalid code, on a run other than an end of block crossing the block end (both
+ *                  accepted by the CPU decoder differently) and on a window refill with no chunk left (the window
+ *                  would otherwise be reread and the canonical position lost)
  * @return 0 if succeeds, otherwise nonzero
  */
+template <bool WRITE = true, bool CHECKED = false>
 __device__ inline int
 gpujpeg_huffman_gpu_decoder_decode_block(
     struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
@@ -338,14 +354,19 @@ gpujpeg_huffman_gpu_decoder_decode_block(
     
     // Section F.2.2.1: decode the DC coefficient difference
     // Get the coefficient value (using DC coding table)
-    int dc_coefficient_value = gpujpeg_huffman_gpu_decoder_get_coefficient(huffman_gpu_decoder, r_bit, r_bit_count, s_byte, s_byte_idx, dc_table_offset, coefficient_idx);
+    int dc_coefficient_value = gpujpeg_huffman_gpu_decoder_get_coefficient<CHECKED>(huffman_gpu_decoder, r_bit, r_bit_count, s_byte, s_byte_idx, dc_table_offset, coefficient_idx);
+    if ( CHECKED && coefficient_idx > 64 ) {
+        return -1;
+    }
 
     // Convert DC difference to actual value, update last_dc_val
     dc = dc_coefficient_value += dc;
 
     // Output the DC coefficient (assumes gpujpeg_natural_order[0] = 0)
     // TODO: try to skip saving of zero coefficients
-    data_output[0] = dc_coefficient_value;
+    if ( WRITE ) {
+        data_output[0] = dc_coefficient_value;
+    }
     
     // TODO: error check: coefficient_idx must still be 0 in valid codestreams
     coefficient_idx = 1;
@@ -355,6 +376,9 @@ gpujpeg_huffman_gpu_decoder_decode_block(
     do {
         // Possibly load more bytes into shared buffer from global memory
         if(s_byte_idx >= 16) {
+            if ( CHECKED && d_byte_chunk_count == 0 ) {
+                return -1;
+            }
             // Move remaining bytes to begin and update index of next byte
             s_byte[0] = s_byte[1];
             s_byte_idx -= 16;
@@ -367,19 +391,26 @@ gpujpeg_huffman_gpu_decoder_decode_block(
         }
         
         // decode next coefficient, updating its destination index
-        const int coefficient_value = gpujpeg_huffman_gpu_decoder_get_coefficient(huffman_gpu_decoder, r_bit, r_bit_count, s_byte, s_byte_idx, ac_table_offset, coefficient_idx);
+        const unsigned int previous_coefficient_idx = coefficient_idx;
+        const int coefficient_value = gpujpeg_huffman_gpu_decoder_get_coefficient<CHECKED>(huffman_gpu_decoder, r_bit, r_bit_count, s_byte, s_byte_idx, ac_table_offset, coefficient_idx);
         
         // stop with this block if have all coefficients
         if(coefficient_idx > 64) {
+            // end of block advances by 64
+            if ( CHECKED && coefficient_idx != previous_coefficient_idx + 64 ) {
+                return -1;
+            }
             break;
         }
         
         // save the coefficient   TODO: try to ommit saving 0 coefficients
+        if ( WRITE ) {
 #ifdef HUFFMAN_GPU_CONST_TABLES
-        data_output[gpujpeg_huffman_gpu_decoder_order_natural[coefficient_idx - 1]] = coefficient_value;
+            data_output[gpujpeg_huffman_gpu_decoder_order_natural[coefficient_idx - 1]] = coefficient_value;
 #else
-        data_output[huffman_gpu_decoder.d_order_natural[coefficient_idx - 1]] = coefficient_value;
+            data_output[huffman_gpu_decoder.d_order_natural[coefficient_idx - 1]] = coefficient_value;
 #endif
+        }
     } while(coefficient_idx < 64);
     
     return 0;
@@ -603,14 +634,23 @@ gpujpeg_huffman_decoder_table_kernel(
                 const struct gpujpeg_table_huffman_decoder* const d_table_y_dc,
                 const struct gpujpeg_table_huffman_decoder* const d_table_y_ac,
                 const struct gpujpeg_table_huffman_decoder* const d_table_cbcr_dc,
-                const struct gpujpeg_table_huffman_decoder* const d_table_cbcr_ac
+                const struct gpujpeg_table_huffman_decoder* const d_table_cbcr_ac,
+                const int table_mask
 ) {
-    // Each thread uses all 4 Huffman tables to "decode" one symbol from its unique 16bits.
+    // Each thread uses all 4 Huffman tables (those in table_mask) to "decode" one symbol from its unique 16bits.
     const int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    gpujpeg_huffman_gpu_decoder_table_setup(huffman_gpu_decoder, idx, d_table_y_dc, 0);
-    gpujpeg_huffman_gpu_decoder_table_setup(huffman_gpu_decoder, idx, d_table_y_ac, 1);
-    gpujpeg_huffman_gpu_decoder_table_setup(huffman_gpu_decoder, idx, d_table_cbcr_dc, 2);
-    gpujpeg_huffman_gpu_decoder_table_setup(huffman_gpu_decoder, idx, d_table_cbcr_ac, 3);
+    if ( (table_mask & 1) != 0 ) {
+        gpujpeg_huffman_gpu_decoder_table_setup(huffman_gpu_decoder, idx, d_table_y_dc, 0);
+    }
+    if ( (table_mask & 2) != 0 ) {
+        gpujpeg_huffman_gpu_decoder_table_setup(huffman_gpu_decoder, idx, d_table_y_ac, 1);
+    }
+    if ( (table_mask & 4) != 0 ) {
+        gpujpeg_huffman_gpu_decoder_table_setup(huffman_gpu_decoder, idx, d_table_cbcr_dc, 2);
+    }
+    if ( (table_mask & 8) != 0 ) {
+        gpujpeg_huffman_gpu_decoder_table_setup(huffman_gpu_decoder, idx, d_table_cbcr_ac, 3);
+    }
 }
 
 /* Documented at declaration */
@@ -647,6 +687,43 @@ gpujpeg_huffman_gpu_decoder_destroy(struct gpujpeg_huffman_gpu_decoder *huffman_
     free(huffman_gpu_decoder);
 }
 
+/**
+ * Builds the fast decoding tables in table_mask (bit Huffman table index * 2 + AC) from the decoder's tables
+ *
+ * @return 0 if succeeds, otherwise nonzero
+ */
+static int
+gpujpeg_huffman_gpu_decoder_build_tables(struct gpujpeg_decoder* decoder, int table_mask)
+{
+    struct gpujpeg_coder* coder = &decoder->coder;
+
+    // Setup GPU tables (one thread for each of 65536 entries)
+    gpujpeg_huffman_decoder_table_kernel<<<256, 256, 0, coder->stream>>>(
+        *decoder->huffman_gpu_decoder,
+        decoder->d_table_huffman[GPUJPEG_COMPONENT_LUMINANCE][GPUJPEG_HUFFMAN_DC],
+        decoder->d_table_huffman[GPUJPEG_COMPONENT_LUMINANCE][GPUJPEG_HUFFMAN_AC],
+        decoder->d_table_huffman[GPUJPEG_COMPONENT_CHROMINANCE][GPUJPEG_HUFFMAN_DC],
+        decoder->d_table_huffman[GPUJPEG_COMPONENT_CHROMINANCE][GPUJPEG_HUFFMAN_AC],
+        table_mask
+    );
+    gpujpeg_cuda_check_error("Huffman decoder table setup failed", return -1);
+
+#ifdef HUFFMAN_GPU_CONST_TABLES
+    // Copy quick decoding table into constant memory
+    cudaMemcpyToSymbolAsync(
+        gpujpeg_huffman_gpu_decoder_tables_quick_const,
+        decoder->huffman_gpu_decoder->d_tables_quick,
+        sizeof(*decoder->huffman_gpu_decoder->d_tables_quick) * QUICK_TABLE_ITEMS,
+        0,
+        cudaMemcpyDeviceToDevice,
+        coder->stream
+    );
+    gpujpeg_cuda_check_error("Huffman decoder table copy failed", return -1);
+#endif
+
+    return 0;
+}
+
 /* Documented at declaration */
 int
 gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder)
@@ -670,28 +747,9 @@ gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder)
     cudaFuncSetCacheConfig(gpujpeg_huffman_decoder_decode_kernel<true, THREADS_PER_TBLOCK>, cudaFuncCachePreferShared);
     cudaFuncSetCacheConfig(gpujpeg_huffman_decoder_decode_kernel<false, THREADS_PER_TBLOCK>, cudaFuncCachePreferShared);
     
-    // Setup GPU tables (one thread for each of 65536 entries)
-    gpujpeg_huffman_decoder_table_kernel<<<256, 256, 0, coder->stream>>>(
-        *decoder->huffman_gpu_decoder,
-        decoder->d_table_huffman[GPUJPEG_COMPONENT_LUMINANCE][GPUJPEG_HUFFMAN_DC],
-        decoder->d_table_huffman[GPUJPEG_COMPONENT_LUMINANCE][GPUJPEG_HUFFMAN_AC],
-        decoder->d_table_huffman[GPUJPEG_COMPONENT_CHROMINANCE][GPUJPEG_HUFFMAN_DC],
-        decoder->d_table_huffman[GPUJPEG_COMPONENT_CHROMINANCE][GPUJPEG_HUFFMAN_AC]
-    );
-    gpujpeg_cuda_check_error("Huffman decoder table setup failed", return -1);
-
-#ifdef HUFFMAN_GPU_CONST_TABLES
-    // Copy quick decoding table into constant memory
-    cudaMemcpyToSymbolAsync(
-        gpujpeg_huffman_gpu_decoder_tables_quick_const,
-        decoder->huffman_gpu_decoder->d_tables_quick,
-        sizeof(*decoder->huffman_gpu_decoder->d_tables_quick) * QUICK_TABLE_ITEMS,
-        0,
-        cudaMemcpyDeviceToDevice,
-        coder->stream
-    );
-    gpujpeg_cuda_check_error("Huffman decoder table copy failed", return -1);
-#endif
+    if ( gpujpeg_huffman_gpu_decoder_build_tables(decoder, 0xF) != 0 ) {
+        return -1;
+    }
 
     for (int comp = 0; comp < coder->param.comp_count; comp++) {
         coder->component[comp].dc_huff_idx = decoder->comp_table_huffman_map[comp][GPUJPEG_HUFFMAN_DC];
@@ -731,6 +789,632 @@ gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder)
     gpujpeg_cuda_check_error("Huffman decoding failed", return -1);
     
     return 0;
+}
+
+/*
+ * Huffman decoding of a scan without restart markers (one segment) by self-synchronization, after Weissenberger and
+ * Schmidt: Accelerating JPEG Decompression on GPUs (arXiv:2111.09219).
+ *
+ * The stuffed entropy-coded data is split into chunks of chunk_bytes. A chunk owns the blocks whose canonical start
+ * position (stuffed bit position, never inside a stuffed zero) precedes the chunk end; a block may continue into the
+ * next chunks, which are then empty. Decoding started at a guessed position usually falls into the true block
+ * boundaries; from a block start with the same position and MCU block phase, two decodings are identical (DC
+ * predictors affect values, not parsing).
+ *  - sequence kernel: each chunk is decoded from a guessed start (exact for chunk 0) without storing, then repairs the
+ *    following chunks of its sequence (seq_chunks chunks, one thread block)
+ *  - link kernel: one thread block repairs across sequences, then replaces the chunk block counts and DC difference
+ *    sums by their exclusive prefixes
+ *  - replay kernel: decodes every chunk again from its predecessor's record, stores the coefficients through the block
+ *    list and certifies the chain (see gpujpeg_huffman_gpu_resync_replay()); any failure or exhausted repair rounds
+ *    are reported in the status and the image is decoded on CPU instead
+ * Records and status live in coder->d_temp_huffman (used only by the encoder otherwise).
+ */
+
+enum {
+    RESYNC_MAX_COMPS = 3,          ///< components of eligible scans
+    RESYNC_STATUS_BYTES = 64,      ///< status size at the beginning of the scratch, records follow
+    RESYNC_MAX_SEQUENCES = 1024,   ///< link kernel threads
+    RESYNC_MAX_CHUNK_BYTES = 4096, ///< keeps the replayed DC predictors within int (see the replay)
+    RESYNC_REPLAY_THREADS = 128,
+};
+#define RESYNC_MAX_BYTES (1U << 28)      ///< bit positions and block counts fit 32 bits
+#define RESYNC_MAX_DC_PREFIX (1LL << 30) ///< replayed DC predictor seed limit
+#define RESYNC_INVALID 0xFFFFFFFFU       ///< phase of a record whose trajectory failed
+
+/** Chunk record */
+struct gpujpeg_huffman_gpu_resync_record
+{
+    long long dc[RESYNC_MAX_COMPS]; ///< DC difference sums of the chunk's blocks (exclusive prefix after linking)
+    unsigned int blocks;            ///< complete blocks starting in the chunk (exclusive prefix after linking)
+    unsigned int end;               ///< canonical bit position after the chunk's blocks
+    unsigned int phase;             ///< MCU block phase at end, RESYNC_INVALID if the trajectory failed in the chunk
+    unsigned int unused;
+};
+
+/** Status at the beginning of the scratch */
+struct gpujpeg_huffman_gpu_resync_status
+{
+    unsigned int repair;   ///< link kernel: GPUJPEG_HUFFMAN_RESYNC_REPAIR_LIMIT or 0 (constant during the replay)
+    unsigned int total;    ///< link kernel: sum of the chunk block counts (constant during the replay)
+    unsigned int error;    ///< replay: GPUJPEG_HUFFMAN_RESYNC_* bits (atomicOr)
+    unsigned int complete; ///< replay: chunks completing the scan (atomicAdd)
+};
+static_assert(sizeof(struct gpujpeg_huffman_gpu_resync_status) <= RESYNC_STATUS_BYTES, "status overlaps records");
+
+/** Block count and DC sums scanned by the link kernel in the reader windows */
+struct gpujpeg_huffman_gpu_resync_sum
+{
+    unsigned long long blocks;
+    long long dc[RESYNC_MAX_COMPS];
+};
+static_assert(sizeof(struct gpujpeg_huffman_gpu_resync_sum) == 2 * sizeof(uint4), "sum must fit a reader window");
+
+/** Scan description (kernel parameter) */
+struct gpujpeg_huffman_gpu_resync_scan
+{
+    const uint8_t* d_data;    ///< stuffed entropy-coded data, zeroed after size up to end_aligned
+    unsigned int size;        ///< entropy-coded bytes
+    unsigned int end_aligned; ///< 16-aligned size + 32 (initialized lookahead, never decoded as data)
+    unsigned int chunk_bytes;
+    unsigned int chunk_count;
+    unsigned int seq_chunks;    ///< chunks per sequence (sequence kernel threads per block)
+    unsigned int repair_rounds; ///< link kernel rounds
+    unsigned int block_count;   ///< blocks of the scan (including padding blocks)
+    unsigned int mcu_blocks;    ///< blocks per MCU (1, 3, 4 or 6)
+    unsigned int phase_comp;    ///< component of each MCU block phase (2 bits per phase)
+    unsigned int comp_table;    ///< Huffman table index (0 or 1) of each component (bit per component)
+    struct gpujpeg_huffman_gpu_resync_status* d_status;
+    struct gpujpeg_huffman_gpu_resync_record* d_record;
+};
+
+/** Bit reader state (as the variables of gpujpeg_huffman_decoder_decode_kernel()) */
+struct gpujpeg_huffman_gpu_resync_reader
+{
+    unsigned int r_bit;
+    unsigned int r_bit_count;
+    uint4* s_byte; ///< 32-byte window in shared memory
+    unsigned int s_byte_idx;
+    const uint4* d_byte; ///< next 16-byte chunk to load
+    unsigned int d_byte_chunk_count;
+};
+
+/**
+ * Starts reading at a canonical bit position (at most 8 * size). All loads stay below scan.end_aligned, which is
+ * at least 32 bytes after the position's 16-byte chunk.
+ */
+__device__ inline void
+gpujpeg_huffman_gpu_resync_seek(struct gpujpeg_huffman_gpu_resync_reader& rd,
+                                const struct gpujpeg_huffman_gpu_resync_scan& scan, unsigned int bitpos)
+{
+    const unsigned int byte_idx = bitpos / 8;
+    const unsigned int byte_idx_aligned = byte_idx & ~15U;
+    rd.d_byte = (const uint4*)(scan.d_data + byte_idx_aligned);
+    rd.s_byte[0] = rd.d_byte[0];
+    rd.s_byte[1] = rd.d_byte[1];
+    rd.d_byte += 2;
+    rd.d_byte_chunk_count = (scan.end_aligned - byte_idx_aligned) / 16 - 2;
+    rd.s_byte_idx = byte_idx - byte_idx_aligned;
+    rd.r_bit = 0;
+    rd.r_bit_count = 0;
+    gpujpeg_huffman_gpu_decoder_get_bits(bitpos % 8, rd.r_bit, rd.r_bit_count, rd.s_byte, rd.s_byte_idx);
+}
+
+/**
+ * Canonical bit position of the next unread bit. The window holds the 32 bytes before d_byte as long as every shift
+ * loaded a chunk (checked decoding fails otherwise). The bit buffer keeps consumed bits, so its low byte is the last
+ * byte loaded; a loaded 0xFF was followed by a skipped stuffed zero. At most 23 bits are buffered.
+ */
+__device__ inline unsigned int
+gpujpeg_huffman_gpu_resync_cursor(const struct gpujpeg_huffman_gpu_resync_reader& rd, const uint8_t* d_data)
+{
+    unsigned int next_byte = (unsigned int)((const uint8_t*)rd.d_byte - d_data) - 32 + rd.s_byte_idx;
+    unsigned int bits = rd.r_bit;
+    unsigned int count = rd.r_bit_count;
+    for ( ; count >= 8; count -= 8, bits >>= 8 ) { // unload the whole unread bytes
+        next_byte -= (bits & 0xFF) == 0xFF ? 2 : 1;
+    }
+    if ( count == 0 ) {
+        return next_byte * 8;
+    }
+    return (next_byte - ((bits & 0xFF) == 0xFF ? 2 : 1)) * 8 + 8 - count;
+}
+
+/**
+ * Decodes one block with checks (see gpujpeg_huffman_gpu_decoder_decode_block()), updating dc and pos
+ * @retval false invalid code or run, or data consumed beyond the entropy-coded data (lookahead is not data)
+ */
+template <bool WRITE>
+__device__ inline bool
+gpujpeg_huffman_gpu_resync_block(struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
+                                 const struct gpujpeg_huffman_gpu_resync_scan& scan,
+                                 struct gpujpeg_huffman_gpu_resync_reader& rd, unsigned int comp, int& dc,
+                                 int16_t* data_output, unsigned int& pos)
+{
+    const unsigned int table_offset = ((scan.comp_table >> comp) & 1) * 0x20000;
+    if ( gpujpeg_huffman_gpu_decoder_decode_block<WRITE, true>(
+             huffman_gpu_decoder, dc, data_output, table_offset, table_offset + 0x10000, rd.r_bit, rd.r_bit_count,
+             rd.s_byte, rd.s_byte_idx, rd.d_byte, rd.d_byte_chunk_count) != 0 ) {
+        return false;
+    }
+    pos = gpujpeg_huffman_gpu_resync_cursor(rd, scan.d_data);
+    return pos <= scan.size * 8;
+}
+
+/**
+ * Decodes (without storing) the blocks of a chunk from the reader state and phase. If a block fails, the record is
+ * invalid but keeps the blocks completed before it.
+ */
+__device__ inline struct gpujpeg_huffman_gpu_resync_record
+gpujpeg_huffman_gpu_resync_skip_chunk(struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
+                                      const struct gpujpeg_huffman_gpu_resync_scan& scan,
+                                      struct gpujpeg_huffman_gpu_resync_reader& rd, unsigned int& phase,
+                                      unsigned int chunk)
+{
+    struct gpujpeg_huffman_gpu_resync_record record = {};
+    const unsigned int chunk_end = (chunk + 1) * scan.chunk_bytes * 8;
+    unsigned int pos = gpujpeg_huffman_gpu_resync_cursor(rd, scan.d_data);
+    while ( pos < chunk_end ) {
+        const unsigned int comp = (scan.phase_comp >> (2 * phase)) & 3;
+        int dc = 0;
+        if ( !gpujpeg_huffman_gpu_resync_block<false>(huffman_gpu_decoder, scan, rd, comp, dc, NULL, pos) ) {
+            record.phase = RESYNC_INVALID;
+            return record;
+        }
+        record.dc[comp] += dc;
+        record.blocks += 1;
+        phase = phase + 1 == scan.mcu_blocks ? 0 : phase + 1;
+    }
+    record.end = pos;
+    record.phase = phase;
+    return record;
+}
+
+/// @retval true if a repaired chunk ends in the (valid) state of the chunk's previous record
+__device__ inline bool
+gpujpeg_huffman_gpu_resync_joined(const struct gpujpeg_huffman_gpu_resync_record& record,
+                                  const struct gpujpeg_huffman_gpu_resync_record& previous)
+{
+    return record.phase != RESYNC_INVALID && record.phase == previous.phase && record.end == previous.end;
+}
+
+/**
+ * Intra-sequence synchronization: thread t of block s decodes chunk s * blockDim.x + t from a guessed start, then
+ * repairs the following chunks of the sequence, one per round, from its own state: a round's chunk is decoded,
+ * compared with the chunk's record and the record always replaced (the counts depend on the start). Matching ends
+ * the trajectory, which then joined the one of the record. Each record has one writer per round and a smaller origin
+ * reaches it in a later round, so the sequence becomes consistent with its first chunk.
+ */
+__global__ void __launch_bounds__(1024)
+    gpujpeg_huffman_decoder_resync_sequence_kernel(struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
+                                                   struct gpujpeg_huffman_gpu_resync_scan scan)
+{
+    extern __shared__ uint4 s_resync_window[]; // 32 bytes per thread
+    struct gpujpeg_huffman_gpu_resync_reader rd;
+    rd.s_byte = s_resync_window + 2 * threadIdx.x;
+    const unsigned int seq_end = min((blockIdx.x + 1) * blockDim.x, scan.chunk_count);
+    unsigned int chunk = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int phase = 0;
+    bool active = chunk < seq_end;
+    if ( active ) {
+        // the chunk's first byte or, if it is a stuffed zero, the next one (the reader ensures each 0xFF of the
+        // segment is followed by a stuffed zero)
+        unsigned int start = chunk * scan.chunk_bytes;
+        if ( chunk != 0 && scan.d_data[start - 1] == 0xFF ) {
+            start += 1;
+        }
+        gpujpeg_huffman_gpu_resync_seek(rd, scan, start * 8);
+        const struct gpujpeg_huffman_gpu_resync_record record =
+            gpujpeg_huffman_gpu_resync_skip_chunk(huffman_gpu_decoder, scan, rd, phase, chunk);
+        scan.d_record[chunk] = record;
+        active = record.phase != RESYNC_INVALID && chunk + 1 < seq_end;
+    }
+    // inactive threads keep taking part in the barriers
+    while ( __syncthreads_or(active) ) {
+        if ( active ) {
+            chunk += 1;
+            const struct gpujpeg_huffman_gpu_resync_record previous = scan.d_record[chunk];
+            const struct gpujpeg_huffman_gpu_resync_record record =
+                gpujpeg_huffman_gpu_resync_skip_chunk(huffman_gpu_decoder, scan, rd, phase, chunk);
+            scan.d_record[chunk] = record;
+            active = record.phase != RESYNC_INVALID && !gpujpeg_huffman_gpu_resync_joined(record, previous) &&
+                     chunk + 1 < seq_end;
+        }
+    }
+}
+
+/**
+ * Inter-sequence synchronization and prefix scan (single thread block, thread q for sequence q). Thread q >= 1
+ * continues from the end record of sequence q - 1 as the sequence kernel left it (read before the first barrier) and
+ * repairs chunk q * seq_chunks + r in round r as the sequence kernel. Chunks repaired in one round differ by
+ * seq_chunks; a smaller origin reaches a chunk in a later round, so the trajectory from the anchored sequence 0
+ * dominates. A trajectory still repairing after repair_rounds sets the repair limit status (decoded on CPU). Then the
+ * block counts and DC sums of the chunks are replaced by their exclusive prefixes and the total is stored.
+ */
+__global__ void __launch_bounds__(1024)
+    gpujpeg_huffman_decoder_resync_link_kernel(struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
+                                               struct gpujpeg_huffman_gpu_resync_scan scan)
+{
+    extern __shared__ uint4 s_resync_window[]; // 32 bytes per thread
+    struct gpujpeg_huffman_gpu_resync_reader rd;
+    rd.s_byte = s_resync_window + 2 * threadIdx.x;
+    const unsigned int seq = threadIdx.x;
+    const unsigned int seq_begin = min(seq * scan.seq_chunks, scan.chunk_count);
+    const unsigned int seq_end = min(seq_begin + scan.seq_chunks, scan.chunk_count);
+    if ( seq == 0 ) {
+        scan.d_status->repair = 0;
+        scan.d_status->error = 0;
+        scan.d_status->complete = 0;
+    }
+
+    unsigned int chunk = seq_begin;
+    unsigned int phase = 0;
+    bool active = seq != 0 && seq_begin < seq_end;
+    if ( active ) {
+        const struct gpujpeg_huffman_gpu_resync_record seed = scan.d_record[seq_begin - 1];
+        active = seed.phase != RESYNC_INVALID && seed.end <= scan.size * 8;
+        if ( active ) {
+            phase = seed.phase;
+            gpujpeg_huffman_gpu_resync_seek(rd, scan, seed.end);
+        }
+    }
+    for ( unsigned int round = 0; __syncthreads_or(active); ++round ) {
+        if ( round == scan.repair_rounds ) { // uniform
+            if ( seq == 0 ) {
+                scan.d_status->repair = GPUJPEG_HUFFMAN_RESYNC_REPAIR_LIMIT;
+            }
+            break;
+        }
+        if ( active ) {
+            const struct gpujpeg_huffman_gpu_resync_record previous = scan.d_record[chunk];
+            const struct gpujpeg_huffman_gpu_resync_record record =
+                gpujpeg_huffman_gpu_resync_skip_chunk(huffman_gpu_decoder, scan, rd, phase, chunk);
+            scan.d_record[chunk] = record;
+            active = record.phase != RESYNC_INVALID && !gpujpeg_huffman_gpu_resync_joined(record, previous) &&
+                     chunk + 1 < scan.chunk_count;
+            chunk += 1;
+        }
+    }
+    __syncthreads();
+
+    // exclusive prefix scan: each thread sums its sequence's chunks, the sums are scanned in the (no longer used)
+    // reader windows, then each thread rewrites its chunks
+    struct gpujpeg_huffman_gpu_resync_sum own = {};
+    for ( unsigned int i = seq_begin; i < seq_end; ++i ) {
+        own.blocks += scan.d_record[i].blocks;
+        for ( int comp = 0; comp < RESYNC_MAX_COMPS; ++comp ) {
+            own.dc[comp] += scan.d_record[i].dc[comp];
+        }
+    }
+    struct gpujpeg_huffman_gpu_resync_sum* const s_sum = (struct gpujpeg_huffman_gpu_resync_sum*)s_resync_window;
+    s_sum[seq] = own;
+    __syncthreads();
+    for ( unsigned int offset = 1; offset < blockDim.x; offset *= 2 ) { // inclusive
+        struct gpujpeg_huffman_gpu_resync_sum add = {};
+        if ( seq >= offset ) {
+            add = s_sum[seq - offset];
+        }
+        __syncthreads();
+        s_sum[seq].blocks += add.blocks;
+        for ( int comp = 0; comp < RESYNC_MAX_COMPS; ++comp ) {
+            s_sum[seq].dc[comp] += add.dc[comp];
+        }
+        __syncthreads();
+    }
+    struct gpujpeg_huffman_gpu_resync_sum prefix = s_sum[seq];
+    if ( seq == blockDim.x - 1 ) {
+        scan.d_status->total = (unsigned int)prefix.blocks;
+    }
+    prefix.blocks -= own.blocks;
+    for ( int comp = 0; comp < RESYNC_MAX_COMPS; ++comp ) {
+        prefix.dc[comp] -= own.dc[comp];
+    }
+    for ( unsigned int i = seq_begin; i < seq_end; ++i ) {
+        struct gpujpeg_huffman_gpu_resync_record* const record = &scan.d_record[i];
+        const unsigned int blocks = record->blocks;
+        record->blocks = (unsigned int)prefix.blocks;
+        prefix.blocks += blocks;
+        for ( int comp = 0; comp < RESYNC_MAX_COMPS; ++comp ) {
+            const long long dc = record->dc[comp];
+            record->dc[comp] = prefix.dc[comp];
+            prefix.dc[comp] += dc;
+        }
+    }
+}
+
+/// @retval true if at most 7 one bits (rest of one data byte, possibly followed by its stuffed zero) follow pos
+__device__ inline bool
+gpujpeg_huffman_gpu_resync_padding_valid(const struct gpujpeg_huffman_gpu_resync_scan& scan, unsigned int pos)
+{
+    if ( pos == scan.size * 8 ) {
+        return true;
+    }
+    const unsigned int byte_idx = pos / 8;
+    const unsigned int padding_bits = 8 - pos % 8;
+    const unsigned int byte_value = scan.d_data[byte_idx];
+    const unsigned int ones = (1U << padding_bits) - 1;
+    return padding_bits < 8 && (byte_value & ones) == ones && byte_idx + (byte_value == 0xFF ? 2 : 1) == scan.size;
+}
+
+/**
+ * Replays the blocks first..min(next, block_count) - 1 of a chunk (first < block_count, prefixes monotone) and
+ * certifies them. By induction from the exact scan start, each chunk decodes the true blocks from the true state:
+ * its start record must be valid with the phase of its block prefix, all its blocks must start in the chunk and
+ * decode with checks, and a chunk followed by more blocks must end in its own record's state with the next chunk's
+ * DC prefix. The chunk with the last block must be followed only by padding; the host requires exactly one such.
+ *
+ * @return GPUJPEG_HUFFMAN_RESYNC_* bits, 0 if succeeded
+ */
+__device__ inline unsigned int
+gpujpeg_huffman_gpu_resync_replay(struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
+                                  const struct gpujpeg_huffman_gpu_resync_scan& scan, uint4* s_byte,
+                                  const uint64_t* d_block_list, int16_t* d_data_quantized, unsigned int chunk,
+                                  unsigned int first, unsigned int next)
+{
+    const struct gpujpeg_huffman_gpu_resync_record* const d_record = scan.d_record;
+    // DC predictors after the previous chunks, small enough not to overflow in this chunk's at most
+    // 4 * chunk_bytes + 1 blocks (each takes at least 2 bits)
+    int dc[RESYNC_MAX_COMPS];
+    for ( int comp = 0; comp < RESYNC_MAX_COMPS; ++comp ) {
+        const long long prefix = d_record[chunk].dc[comp];
+        if ( chunk == 0 ? prefix != 0 : (prefix < -RESYNC_MAX_DC_PREFIX || prefix > RESYNC_MAX_DC_PREFIX) ) {
+            return chunk == 0 ? GPUJPEG_HUFFMAN_RESYNC_ORDER : GPUJPEG_HUFFMAN_RESYNC_DECODE;
+        }
+        dc[comp] = (int)prefix;
+    }
+    // start in the exact scan start or in the previous chunk's end (which is in this chunk or after it)
+    unsigned int pos = 0;
+    unsigned int phase = 0;
+    if ( chunk != 0 ) {
+        const struct gpujpeg_huffman_gpu_resync_record previous = d_record[chunk - 1];
+        if ( previous.phase == RESYNC_INVALID || previous.phase != first % scan.mcu_blocks ||
+             previous.end < chunk * scan.chunk_bytes * 8 || previous.end > scan.size * 8 ) {
+            return GPUJPEG_HUFFMAN_RESYNC_START;
+        }
+        pos = previous.end;
+        phase = previous.phase;
+    }
+    struct gpujpeg_huffman_gpu_resync_reader rd;
+    rd.s_byte = s_byte;
+    gpujpeg_huffman_gpu_resync_seek(rd, scan, pos);
+
+    const unsigned int chunk_end = (chunk + 1) * scan.chunk_bytes * 8;
+    const unsigned int last = min(next, scan.block_count);
+    for ( unsigned int block = first; block < last; ++block ) {
+        if ( pos >= chunk_end ) {
+            return GPUJPEG_HUFFMAN_RESYNC_OWNERSHIP;
+        }
+        const uint64_t packed_block_info = d_block_list[block];
+        const unsigned int comp = packed_block_info & 0x7f;
+        if ( comp >= RESYNC_MAX_COMPS ||
+             !gpujpeg_huffman_gpu_resync_block<true>(huffman_gpu_decoder, scan, rd, comp, dc[comp],
+                                                     d_data_quantized + (packed_block_info >> 8), pos) ) {
+            return GPUJPEG_HUFFMAN_RESYNC_DECODE;
+        }
+        phase = phase + 1 == scan.mcu_blocks ? 0 : phase + 1;
+    }
+
+    if ( next < scan.block_count ) { // continued by the next chunk
+        if ( chunk + 1 == scan.chunk_count ) {
+            return GPUJPEG_HUFFMAN_RESYNC_INCOMPLETE; // block counts sum to less than the scan
+        }
+        const struct gpujpeg_huffman_gpu_resync_record own = d_record[chunk];
+        if ( own.phase != phase || own.end != pos ) {
+            return GPUJPEG_HUFFMAN_RESYNC_ENDPOINT;
+        }
+        for ( int comp = 0; comp < RESYNC_MAX_COMPS; ++comp ) {
+            if ( dc[comp] != d_record[chunk + 1].dc[comp] ) {
+                return GPUJPEG_HUFFMAN_RESYNC_ENDPOINT;
+            }
+        }
+        return 0;
+    }
+    if ( !gpujpeg_huffman_gpu_resync_padding_valid(scan, pos) ) {
+        return GPUJPEG_HUFFMAN_RESYNC_PADDING;
+    }
+    atomicAdd(&scan.d_status->complete, 1);
+    return 0;
+}
+
+/**
+ * Replay of one chunk per thread (gpujpeg_huffman_gpu_resync_replay()), skipped if repair rounds were exhausted.
+ * Every chunk checks that the block prefixes start at 0 and do not decrease.
+ */
+__global__ void
+__launch_bounds__(RESYNC_REPLAY_THREADS)
+    gpujpeg_huffman_decoder_resync_replay_kernel(struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
+                                                 struct gpujpeg_huffman_gpu_resync_scan scan,
+                                                 const uint64_t* d_block_list, int16_t* d_data_quantized)
+{
+    __shared__ uint4 s_byte_all[2 * RESYNC_REPLAY_THREADS]; // 32 bytes per thread
+    const unsigned int chunk = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( chunk >= scan.chunk_count || scan.d_status->repair != 0 ) {
+        return;
+    }
+    const unsigned int first = scan.d_record[chunk].blocks;
+    const unsigned int next = chunk + 1 < scan.chunk_count ? scan.d_record[chunk + 1].blocks : scan.d_status->total;
+    unsigned int error = 0;
+    if ( next < first || (chunk == 0 && first != 0) ) {
+        error = GPUJPEG_HUFFMAN_RESYNC_ORDER;
+    }
+    else if ( first < scan.block_count ) {
+        error = gpujpeg_huffman_gpu_resync_replay(huffman_gpu_decoder, scan, s_byte_all + 2 * threadIdx.x, d_block_list,
+                                                  d_data_quantized, chunk, first, next);
+    }
+    if ( error != 0 ) {
+        atomicOr(&scan.d_status->error, error);
+    }
+}
+
+/**
+ * @retval true if a Huffman table is a baseline table that the checked decoding reads as the CPU decoder: a prefix
+ *              code of at most 256 symbols, DC categories 0-11, AC run/size with size 1-10, end of block or ZRL
+ */
+static bool
+gpujpeg_huffman_gpu_resync_table_valid(const struct gpujpeg_table_huffman_decoder* table, bool ac)
+{
+    unsigned int count = 0;
+    unsigned long kraft_sum = 0; // sum of 2^(16 - code length)
+    for ( int length = 1; length <= 16; ++length ) {
+        count += table->bits[length];
+        kraft_sum += (unsigned long)table->bits[length] << (16 - length);
+    }
+    if ( count == 0 || count > 256 || kraft_sum > 1UL << 16 ) {
+        return false;
+    }
+    for ( unsigned int i = 0; i < count; ++i ) {
+        const unsigned int symbol = table->huffval[i];
+        const unsigned int size = symbol & 0xF;
+        if ( ac ? (size == 0 ? symbol != 0x00 && symbol != 0xF0 : size > 10) : symbol > 11 ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Describes the scan for the decoding without restart markers (Huffman tables are not checked here)
+ * @retval false if not eligible
+ */
+static bool
+gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
+                                     struct gpujpeg_huffman_gpu_resync_scan* scan)
+{
+    const struct gpujpeg_coder* coder = &decoder->coder;
+    const struct gpujpeg_huffman_gpu_resync_param* param = &decoder->resync_param;
+    if ( !decoder->huffman_resync_eligible || coder->param.restart_interval != 0 || decoder->segment_count != 1 ||
+         coder->segment_count != 1 ) {
+        return false;
+    }
+    const struct gpujpeg_segment* segment = &coder->segment[0];
+    const size_t size = decoder->data_compressed_size;
+    if ( size == 0 || size < param->min_bytes || size > RESYNC_MAX_BYTES || segment->data_compressed_index != 0 ||
+         segment->data_compressed_size != size || segment->block_index_list_begin != 0 ||
+         segment->block_count != coder->block_count ) {
+        return false;
+    }
+
+    // grayscale 1x1 or interleaved Y 1x1, 2x1 or 2x2 with Cb and Cr 1x1
+    const struct gpujpeg_component_sampling_factor* sampling = coder->param.sampling_factor;
+    unsigned int mcu_blocks = 0;
+    if ( coder->param.comp_count == 1 && sampling[0].horizontal == 1 && sampling[0].vertical == 1 ) {
+        mcu_blocks = 1;
+    }
+    else if ( coder->param.comp_count == 3 && coder->param.interleaved == 1 && sampling[0].vertical >= 1 &&
+              sampling[0].vertical <= sampling[0].horizontal && sampling[0].horizontal <= 2 &&
+              sampling[1].horizontal == 1 && sampling[1].vertical == 1 && sampling[2].horizontal == 1 &&
+              sampling[2].vertical == 1 ) {
+        mcu_blocks = sampling[0].horizontal * sampling[0].vertical + 2;
+    }
+    if ( mcu_blocks == 0 || coder->block_count < (int)mcu_blocks ) {
+        return false;
+    }
+    unsigned int phase_comp = 0; // components of the first MCU's blocks in scan order
+    for ( unsigned int phase = 0; phase < mcu_blocks; ++phase ) {
+        phase_comp |= (unsigned int)(coder->block_list[phase] & 0x7f) << (2 * phase);
+    }
+    unsigned int comp_table = 0;
+    for ( int comp = 0; comp < coder->param.comp_count; ++comp ) {
+        const int index = decoder->comp_table_huffman_map[comp][GPUJPEG_HUFFMAN_DC];
+        if ( index < 0 || index > 1 || index != decoder->comp_table_huffman_map[comp][GPUJPEG_HUFFMAN_AC] ) {
+            return false;
+        }
+        comp_table |= (unsigned int)index << comp;
+    }
+
+    // kernel limits, initialized lookahead and scratch (status and records) within the allocations
+    if ( param->chunk_bytes < 1 || param->chunk_bytes > RESYNC_MAX_CHUNK_BYTES || param->seq_chunks < 1 ||
+         param->seq_chunks > 1024 || param->repair_rounds < 1 ) {
+        return false;
+    }
+    const size_t chunk_count = (size + param->chunk_bytes - 1) / param->chunk_bytes;
+    const size_t seq_count = (chunk_count + param->seq_chunks - 1) / param->seq_chunks;
+    const size_t end_aligned = ((size + 15) & ~(size_t)15) + 32;
+    const size_t scratch_size = RESYNC_STATUS_BYTES + chunk_count * sizeof(struct gpujpeg_huffman_gpu_resync_record);
+    if ( seq_count > RESYNC_MAX_SEQUENCES || end_aligned > coder->data_compressed_allocated_size ||
+         scratch_size > coder->data_compressed_allocated_size || (uintptr_t)coder->d_temp_huffman % 16 != 0 ) {
+        return false;
+    }
+
+    scan->d_data = coder->d_data_compressed;
+    scan->size = (unsigned int)size;
+    scan->end_aligned = (unsigned int)end_aligned;
+    scan->chunk_bytes = (unsigned int)param->chunk_bytes;
+    scan->chunk_count = (unsigned int)chunk_count;
+    scan->seq_chunks = (unsigned int)param->seq_chunks;
+    scan->repair_rounds = (unsigned int)param->repair_rounds;
+    scan->block_count = (unsigned int)coder->block_count;
+    scan->mcu_blocks = mcu_blocks;
+    scan->phase_comp = phase_comp;
+    scan->comp_table = comp_table;
+    scan->d_status = (struct gpujpeg_huffman_gpu_resync_status*)coder->d_temp_huffman;
+    scan->d_record = (struct gpujpeg_huffman_gpu_resync_record*)(coder->d_temp_huffman + RESYNC_STATUS_BYTES);
+    return true;
+}
+
+/* Documented at declaration */
+bool
+gpujpeg_huffman_gpu_decoder_resync_possible(const struct gpujpeg_decoder* decoder)
+{
+    struct gpujpeg_huffman_gpu_resync_scan scan;
+    if ( !gpujpeg_huffman_gpu_resync_scan_init(decoder, &scan) ) {
+        return false;
+    }
+    for ( int comp = 0; comp < decoder->coder.param.comp_count; ++comp ) {
+        const int index = decoder->comp_table_huffman_map[comp][GPUJPEG_HUFFMAN_DC];
+        if ( !gpujpeg_huffman_gpu_resync_table_valid(&decoder->table_huffman[index][GPUJPEG_HUFFMAN_DC], false) ||
+             !gpujpeg_huffman_gpu_resync_table_valid(&decoder->table_huffman[index][GPUJPEG_HUFFMAN_AC], true) ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Documented at declaration */
+int
+gpujpeg_huffman_gpu_decoder_resync_decode(struct gpujpeg_decoder* decoder)
+{
+    struct gpujpeg_coder* coder = &decoder->coder;
+    struct gpujpeg_huffman_gpu_resync_scan scan;
+    if ( !gpujpeg_huffman_gpu_resync_scan_init(decoder, &scan) ) {
+        return -1; // precondition
+    }
+
+    // lookahead after the data reads zeros, not leftovers of a previous image
+    cudaMemsetAsync(coder->d_data_compressed + scan.size, 0, scan.end_aligned - scan.size, coder->stream);
+    gpujpeg_cuda_check_error("Huffman decoder lookahead reset failed", return -1);
+
+    // only the tables of the scan (the others may be undefined)
+    int table_mask = 0;
+    for ( int comp = 0; comp < coder->param.comp_count; ++comp ) {
+        table_mask |= 3 << (2 * ((scan.comp_table >> comp) & 1));
+    }
+    if ( gpujpeg_huffman_gpu_decoder_build_tables(decoder, table_mask) != 0 ) {
+        return -1;
+    }
+
+    const unsigned int seq_count = gpujpeg_div_and_round_up(scan.chunk_count, scan.seq_chunks);
+    const unsigned int link_threads = gpujpeg_div_and_round_up(seq_count, 32) * 32;
+    gpujpeg_huffman_decoder_resync_sequence_kernel<<<seq_count, scan.seq_chunks, scan.seq_chunks * 2 * sizeof(uint4),
+                                                     coder->stream>>>(*decoder->huffman_gpu_decoder, scan);
+    gpujpeg_huffman_decoder_resync_link_kernel<<<1, link_threads, link_threads * 2 * sizeof(uint4), coder->stream>>>(
+        *decoder->huffman_gpu_decoder, scan);
+    gpujpeg_huffman_decoder_resync_replay_kernel<<<gpujpeg_div_and_round_up(scan.chunk_count, RESYNC_REPLAY_THREADS),
+                                                   RESYNC_REPLAY_THREADS, 0, coder->stream>>>(
+        *decoder->huffman_gpu_decoder, scan, coder->d_block_list, coder->d_data_quantized);
+    gpujpeg_cuda_check_error("Huffman decoding without restart markers failed", return -1);
+
+    struct gpujpeg_huffman_gpu_resync_status status;
+    cudaMemcpyAsync(&status, scan.d_status, sizeof status, cudaMemcpyDeviceToHost, coder->stream);
+    cudaStreamSynchronize(coder->stream);
+    gpujpeg_cuda_check_error("Huffman decoding without restart markers status", return -1);
+
+    DEBUG_MSG(coder->param.verbose,
+              "Huffman without restart markers: %u chunks of %u B in %u sequences, %zu B of Huffman temp buffer\n",
+              scan.chunk_count, scan.chunk_bytes, seq_count,
+              (size_t)RESYNC_STATUS_BYTES + scan.chunk_count * sizeof(struct gpujpeg_huffman_gpu_resync_record));
+    decoder->huffman_resync_status =
+        status.repair | status.error | (status.complete == 1 ? 0 : (unsigned)GPUJPEG_HUFFMAN_RESYNC_INCOMPLETE);
+    return decoder->huffman_resync_status == 0 ? 0 : 1;
 }
 
 /* vi: set expandtab sw=4 : */
