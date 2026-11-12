@@ -1287,7 +1287,7 @@ gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
     }
     const struct gpujpeg_segment* segment = &coder->segment[0];
     const size_t size = decoder->data_compressed_size;
-    if ( size == 0 || size < param->min_bytes || size > RESYNC_MAX_BYTES || segment->data_compressed_index != 0 ||
+    if ( size == 0 || size > RESYNC_MAX_BYTES || segment->data_compressed_index != 0 ||
          segment->data_compressed_size != size || segment->block_index_list_begin != 0 ||
          segment->block_count != coder->block_count ) {
         return false;
@@ -1321,13 +1321,30 @@ gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
         comp_table |= (unsigned int)index << comp;
     }
 
+    // Smaller scans than min_bytes keep the CPU decoder, except with exactly the shipped defaults (other values, also
+    // from compile-time overrides, keep their meaning): 256x256 interleaved 4:4:4 scans of at least 32 KiB and less
+    // than 64 KiB use 32-byte chunks in sequences of 32 chunks, measured faster than the CPU decoder for such dense
+    // tiles (4:2:0 and sparse tiles were not).
+    int chunk_bytes = param->chunk_bytes;
+    int seq_chunks = param->seq_chunks;
+    if ( size < param->min_bytes ) {
+        const bool shipped_defaults = param->chunk_bytes == 512 && param->seq_chunks == 128 &&
+                                      param->repair_rounds == 128 && param->min_bytes == 262144;
+        if ( !shipped_defaults || coder->param_image.width != 256 || coder->param_image.height != 256 ||
+             mcu_blocks != 3 || size < 32 * 1024 || size >= 64 * 1024 ) {
+            return false;
+        }
+        chunk_bytes = 32;
+        seq_chunks = 32;
+    }
+
     // kernel limits, initialized lookahead and scratch (status and records) within the allocations
-    if ( param->chunk_bytes < 1 || param->chunk_bytes > RESYNC_MAX_CHUNK_BYTES || param->seq_chunks < 1 ||
-         param->seq_chunks > 1024 || param->repair_rounds < 1 ) {
+    if ( chunk_bytes < 1 || chunk_bytes > RESYNC_MAX_CHUNK_BYTES || seq_chunks < 1 || seq_chunks > 1024 ||
+         param->repair_rounds < 1 ) {
         return false;
     }
-    const size_t chunk_count = (size + param->chunk_bytes - 1) / param->chunk_bytes;
-    const size_t seq_count = (chunk_count + param->seq_chunks - 1) / param->seq_chunks;
+    const size_t chunk_count = (size + chunk_bytes - 1) / chunk_bytes;
+    const size_t seq_count = (chunk_count + seq_chunks - 1) / seq_chunks;
     const size_t end_aligned = ((size + 15) & ~(size_t)15) + 32;
     const size_t scratch_size = RESYNC_STATUS_BYTES + chunk_count * sizeof(struct gpujpeg_huffman_gpu_resync_record);
     if ( seq_count > RESYNC_MAX_SEQUENCES || end_aligned > coder->data_compressed_allocated_size ||
@@ -1338,9 +1355,9 @@ gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
     scan->d_data = coder->d_data_compressed;
     scan->size = (unsigned int)size;
     scan->end_aligned = (unsigned int)end_aligned;
-    scan->chunk_bytes = (unsigned int)param->chunk_bytes;
+    scan->chunk_bytes = (unsigned int)chunk_bytes;
     scan->chunk_count = (unsigned int)chunk_count;
-    scan->seq_chunks = (unsigned int)param->seq_chunks;
+    scan->seq_chunks = (unsigned int)seq_chunks;
     scan->repair_rounds = (unsigned int)param->repair_rounds;
     scan->block_count = (unsigned int)coder->block_count;
     scan->mcu_blocks = mcu_blocks;

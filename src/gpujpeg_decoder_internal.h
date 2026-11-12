@@ -48,13 +48,15 @@ enum gpujpeg_huffman_route {
 /**
  * Private limits of the GPU Huffman decoder without restart markers (gpujpeg_huffman_gpu_decoder_resync_decode()),
  * set from compile-time defaults on decoder creation; unit tests use small values to cover chunk and repair limits.
+ * Only exactly the shipped defaults (512, 128, 128, 262144) also decode 256x256 interleaved 4:4:4 scans of at least
+ * 32 KiB and less than 64 KiB, with 32-byte chunks in sequences of 32 chunks (gpujpeg_huffman_gpu_resync_scan_init()).
  */
 struct gpujpeg_huffman_gpu_resync_param
 {
     int chunk_bytes;   ///< entropy-coded (stuffed) bytes per chunk
     int seq_chunks;    ///< chunks repaired together by one thread block (at most 1024)
     int repair_rounds; ///< chunks each sequence repair may walk (exhaustion retries on CPU)
-    size_t min_bytes;  ///< smaller scans keep the CPU decoder
+    size_t min_bytes;  ///< smaller scans use CPU unless the documented default exception applies
 };
 
 /**

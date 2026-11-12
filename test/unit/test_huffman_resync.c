@@ -54,6 +54,7 @@ struct rs_jpeg_desc
     bool dht_after_scan;
     enum rs_padding padding;
     unsigned seed;
+    int ac_limit; ///< zig-zag coefficients from this index on are zero (0: as generated)
 };
 
 struct rs_jpeg
@@ -335,6 +336,9 @@ rs_write(const struct rs_jpeg_desc* d)
             for ( int i = 0; i < d->sampling[c][0] * d->sampling[c][1]; ++i, z += 64 ) {
                 const int previous = predictor[c];
                 rs_generate_block(&state, z, &predictor[c]);
+                if ( d->ac_limit > 0 ) { // sparser, same random sequence
+                    memset(z + d->ac_limit, 0, (64 - d->ac_limit) * sizeof *z);
+                }
                 rs_encode_block(&w, z, z[0] - previous, &table[selector[c]][0], &table[selector[c]][1]);
             }
         }
@@ -491,6 +495,69 @@ rs_encode_markers(uint8_t* image, int restart_interval, int interleaved, uint8_t
     param_image.height = 256;
     struct gpujpeg_encoder_input input = gpujpeg_encoder_input_image(image);
     RS_CHECK(gpujpeg_encoder_encode(encoder, &param, &param_image, &input, jpeg, len) == 0);
+}
+
+/**
+ * Library default limits on a reused decoder: below min_bytes, only 256x256 interleaved 4:4:4 scans of 32 KiB up to
+ * 64 KiB are decoded by resynchronization, other limits keep the CPU decoder for them.
+ * @retval false not checked, the library was built with other default limits
+ */
+static bool
+rs_default_policy(void)
+{
+    struct gpujpeg_decoder_init_parameters init = gpujpeg_decoder_default_init_parameters();
+    init.verbose = GPUJPEG_LL_QUIET;
+    struct gpujpeg_decoder* decoder = gpujpeg_decoder_create_with_params(&init);
+    RS_CHECK(decoder != NULL);
+    const struct gpujpeg_huffman_gpu_resync_param defaults = decoder->resync_param;
+    if ( defaults.chunk_bytes != 512 || defaults.seq_chunks != 128 || defaults.repair_rounds != 128 ||
+         defaults.min_bytes != 262144 ) {
+        gpujpeg_decoder_destroy(decoder);
+        return false;
+    }
+    // the first one is admitted, the others differ by AC coefficients (same seed), dimensions (same scan) or layout
+    const struct rs_jpeg_desc cases[] = {
+        {256, 256, 3, {{1, 1}, {1, 1}, {1, 1}}, false, false, false, false, RS_PAD_ONES, 31, 20},
+        {256, 256, 3, {{1, 1}, {1, 1}, {1, 1}}, false, false, false, false, RS_PAD_ONES, 31, 1 }, // sparser
+        {256, 256, 3, {{1, 1}, {1, 1}, {1, 1}}, false, false, false, false, RS_PAD_ONES, 31, 0 }, // denser
+        {255, 256, 3, {{1, 1}, {1, 1}, {1, 1}}, false, false, false, false, RS_PAD_ONES, 31, 20},
+        {256, 255, 3, {{1, 1}, {1, 1}, {1, 1}}, false, false, false, false, RS_PAD_ONES, 31, 20},
+        {256, 256, 3, {{2, 2}, {1, 1}, {1, 1}}, false, false, false, false, RS_PAD_ONES, 31, 40},
+        {256, 256, 1, {{1, 1}},                 false, false, false, false, RS_PAD_ONES, 31, 0 },
+    };
+    const int band[] = {0, -1, 1, 0, 0, 0, 0}; // scan size below (-1), within (0) or above (1) 32 KiB up to 64 KiB
+    enum {
+        CASE_COUNT = sizeof cases / sizeof cases[0],
+    };
+    struct rs_jpeg jpeg[CASE_COUNT];
+    for ( int i = 0; i < CASE_COUNT; ++i ) {
+        jpeg[i] = rs_write(&cases[i]);
+        const size_t size = jpeg[i].scan_size;
+        RS_CHECK((size < 32 * 1024 ? -1 : size < 64 * 1024 ? 0 : 1) == band[i] && size < defaults.min_bytes);
+        rs_decode(decoder, &jpeg[i], i == 0 ? GPUJPEG_HUFFMAN_ROUTE_RESYNC : GPUJPEG_HUFFMAN_ROUTE_CPU, 0,
+                  "default limits");
+        RS_CHECK(decoder->data_compressed_size == size);
+        RS_CHECK(i != 0 || decoder->huffman_resync_status == 0);
+    }
+    rs_decode(decoder, &jpeg[0], GPUJPEG_HUFFMAN_ROUTE_RESYNC, 0, "default limits, again");
+    RS_CHECK(decoder->huffman_resync_status == 0);
+    RS_CHECK(decoder->resync_param.chunk_bytes == defaults.chunk_bytes &&
+             decoder->resync_param.seq_chunks == defaults.seq_chunks &&
+             decoder->resync_param.repair_rounds == defaults.repair_rounds &&
+             decoder->resync_param.min_bytes == defaults.min_bytes);
+
+    decoder->resync_param.min_bytes = SIZE_MAX;
+    rs_decode(decoder, &jpeg[0], GPUJPEG_HUFFMAN_ROUTE_CPU, 0, "larger minimum");
+    decoder->resync_param = defaults;
+    decoder->resync_param.repair_rounds = 1024;
+    rs_decode(decoder, &jpeg[0], GPUJPEG_HUFFMAN_ROUTE_CPU, 0, "other repair rounds");
+    decoder->resync_param = defaults;
+    rs_decode(decoder, &jpeg[0], GPUJPEG_HUFFMAN_ROUTE_RESYNC, 0, "default limits assigned");
+    gpujpeg_decoder_destroy(decoder);
+    for ( int i = 0; i < CASE_COUNT; ++i ) {
+        rs_jpeg_free(&jpeg[i]);
+    }
+    return true;
 }
 
 void
@@ -656,6 +723,9 @@ test_huffman_resync()
     for ( int i = 0; i < LAYOUT_COUNT; ++i ) {
         rs_jpeg_free(&jpeg[i]);
     }
-    printf("Ok (%d of %zu small-chunk decodings synchronized, %d 32-byte chunks start at a stuffed zero)\n",
-           stress_resync_count, (sizeof limits / sizeof limits[0]) * LAYOUT_COUNT, chunk_starts_stuffed);
+    const bool default_policy = rs_default_policy();
+    printf("Ok (%d of %zu small-chunk decodings synchronized, %d 32-byte chunks start at a stuffed zero, default "
+           "small-scan limits %s)\n",
+           stress_resync_count, (sizeof limits / sizeof limits[0]) * LAYOUT_COUNT, chunk_starts_stuffed,
+           default_policy ? "checked" : "not checked (other compile-time defaults)");
 }
