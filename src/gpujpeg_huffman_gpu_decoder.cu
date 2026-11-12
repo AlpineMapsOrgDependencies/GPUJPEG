@@ -857,7 +857,7 @@ struct gpujpeg_huffman_gpu_resync_scan
     unsigned int end_aligned; ///< 16-aligned size + 32 (initialized lookahead, never decoded as data)
     unsigned int chunk_bytes;
     unsigned int chunk_count;
-    unsigned int seq_chunks;    ///< chunks per sequence (sequence kernel threads per block)
+    unsigned int seq_chunks;    ///< chunks per sequence (sequence kernel lanes per block)
     unsigned int repair_rounds; ///< link kernel rounds
     unsigned int block_count;   ///< blocks of the scan (including padding blocks)
     unsigned int mcu_blocks;    ///< blocks per MCU (1, 3, 4 or 6)
@@ -978,23 +978,29 @@ gpujpeg_huffman_gpu_resync_joined(const struct gpujpeg_huffman_gpu_resync_record
 }
 
 /**
- * Intra-sequence synchronization: thread t of block s decodes chunk s * blockDim.x + t from a guessed start, then
+ * Intra-sequence synchronization: lane t of block s decodes chunk s * seq_chunks + t from a guessed start, then
  * repairs the following chunks of the sequence, one per round, from its own state: a round's chunk is decoded,
  * compared with the chunk's record and the record always replaced (the counts depend on the start). Matching ends
  * the trajectory, which then joined the one of the record. Each record has one writer per round and a smaller origin
  * reaches it in a later round, so the sequence becomes consistent with its first chunk.
+ * Launched with seq_chunks << LANE_SHIFT threads per block: lane t is thread t << LANE_SHIFT, the other threads never
+ * decode but take part in every barrier.
  */
+template <unsigned int LANE_SHIFT>
 __global__ void __launch_bounds__(1024)
     gpujpeg_huffman_decoder_resync_sequence_kernel(struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
                                                    struct gpujpeg_huffman_gpu_resync_scan scan)
 {
-    extern __shared__ uint4 s_resync_window[]; // 32 bytes per thread
+    extern __shared__ uint4 s_resync_window[]; // 32 bytes per lane
+    const unsigned int lane = threadIdx.x >> LANE_SHIFT;
+    const bool lane_thread = (threadIdx.x & ((1U << LANE_SHIFT) - 1)) == 0;
     struct gpujpeg_huffman_gpu_resync_reader rd;
-    rd.s_byte = s_resync_window + 2 * threadIdx.x;
-    const unsigned int seq_end = min((blockIdx.x + 1) * blockDim.x, scan.chunk_count);
-    unsigned int chunk = blockIdx.x * blockDim.x + threadIdx.x;
+    rd.s_byte = s_resync_window + 2 * lane;
+    const unsigned int seq_begin = blockIdx.x * scan.seq_chunks;
+    const unsigned int seq_end = min(seq_begin + scan.seq_chunks, scan.chunk_count);
+    unsigned int chunk = seq_begin + lane;
     unsigned int phase = 0;
-    bool active = chunk < seq_end;
+    bool active = lane_thread && chunk < seq_end;
     if ( active ) {
         // the chunk's first byte or, if it is a stuffed zero, the next one (the reader ensures each 0xFF of the
         // segment is followed by a stuffed zero)
@@ -1216,9 +1222,11 @@ gpujpeg_huffman_gpu_resync_replay(struct gpujpeg_huffman_gpu_decoder huffman_gpu
 }
 
 /**
- * Replay of one chunk per thread (gpujpeg_huffman_gpu_resync_replay()), skipped if repair rounds were exhausted.
+ * Replay of chunk c by thread c << LANE_SHIFT (gpujpeg_huffman_gpu_resync_replay()), skipped if repair rounds were
+ * exhausted; the other threads only return (there are no barriers) and each thread uses only its own window.
  * Every chunk checks that the block prefixes start at 0 and do not decrease.
  */
+template <unsigned int LANE_SHIFT>
 __global__ void
 __launch_bounds__(RESYNC_REPLAY_THREADS)
     gpujpeg_huffman_decoder_resync_replay_kernel(struct gpujpeg_huffman_gpu_decoder huffman_gpu_decoder,
@@ -1226,8 +1234,9 @@ __launch_bounds__(RESYNC_REPLAY_THREADS)
                                                  const uint64_t* d_block_list, int16_t* d_data_quantized)
 {
     __shared__ uint4 s_byte_all[2 * RESYNC_REPLAY_THREADS]; // 32 bytes per thread
-    const unsigned int chunk = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( chunk >= scan.chunk_count || scan.d_status->repair != 0 ) {
+    const unsigned int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int chunk = thread >> LANE_SHIFT;
+    if ( (thread & ((1U << LANE_SHIFT) - 1)) != 0 || chunk >= scan.chunk_count || scan.d_status->repair != 0 ) {
         return;
     }
     const unsigned int first = scan.d_record[chunk].blocks;
@@ -1273,11 +1282,12 @@ gpujpeg_huffman_gpu_resync_table_valid(const struct gpujpeg_table_huffman_decode
 
 /**
  * Describes the scan for the decoding without restart markers (Huffman tables are not checked here)
+ * @param small_tile  if not NULL, set (when eligible) to whether the shipped-default small-tile limits apply
  * @retval false if not eligible
  */
 static bool
 gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
-                                     struct gpujpeg_huffman_gpu_resync_scan* scan)
+                                     struct gpujpeg_huffman_gpu_resync_scan* scan, bool* small_tile)
 {
     const struct gpujpeg_coder* coder = &decoder->coder;
     const struct gpujpeg_huffman_gpu_resync_param* param = &decoder->resync_param;
@@ -1327,6 +1337,7 @@ gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
     // tiles (4:2:0 and sparse tiles were not).
     int chunk_bytes = param->chunk_bytes;
     int seq_chunks = param->seq_chunks;
+    bool small_limits = false;
     if ( size < param->min_bytes ) {
         const bool shipped_defaults = param->chunk_bytes == 512 && param->seq_chunks == 128 &&
                                       param->repair_rounds == 128 && param->min_bytes == 262144;
@@ -1336,6 +1347,7 @@ gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
         }
         chunk_bytes = 32;
         seq_chunks = 32;
+        small_limits = true;
     }
 
     // kernel limits, initialized lookahead and scratch (status and records) within the allocations
@@ -1365,6 +1377,9 @@ gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
     scan->comp_table = comp_table;
     scan->d_status = (struct gpujpeg_huffman_gpu_resync_status*)coder->d_temp_huffman;
     scan->d_record = (struct gpujpeg_huffman_gpu_resync_record*)(coder->d_temp_huffman + RESYNC_STATUS_BYTES);
+    if ( small_tile != NULL ) {
+        *small_tile = small_limits;
+    }
     return true;
 }
 
@@ -1373,7 +1388,7 @@ bool
 gpujpeg_huffman_gpu_decoder_resync_possible(const struct gpujpeg_decoder* decoder)
 {
     struct gpujpeg_huffman_gpu_resync_scan scan;
-    if ( !gpujpeg_huffman_gpu_resync_scan_init(decoder, &scan) ) {
+    if ( !gpujpeg_huffman_gpu_resync_scan_init(decoder, &scan, NULL) ) {
         return false;
     }
     for ( int comp = 0; comp < decoder->coder.param.comp_count; ++comp ) {
@@ -1392,7 +1407,8 @@ gpujpeg_huffman_gpu_decoder_resync_decode(struct gpujpeg_decoder* decoder)
 {
     struct gpujpeg_coder* coder = &decoder->coder;
     struct gpujpeg_huffman_gpu_resync_scan scan;
-    if ( !gpujpeg_huffman_gpu_resync_scan_init(decoder, &scan) ) {
+    bool small_tile = false;
+    if ( !gpujpeg_huffman_gpu_resync_scan_init(decoder, &scan, &small_tile) ) {
         return -1; // precondition
     }
 
@@ -1411,13 +1427,31 @@ gpujpeg_huffman_gpu_decoder_resync_decode(struct gpujpeg_decoder* decoder)
 
     const unsigned int seq_count = gpujpeg_div_and_round_up(scan.chunk_count, scan.seq_chunks);
     const unsigned int link_threads = gpujpeg_div_and_round_up(seq_count, 32) * 32;
-    gpujpeg_huffman_decoder_resync_sequence_kernel<<<seq_count, scan.seq_chunks, scan.seq_chunks * 2 * sizeof(uint4),
-                                                     coder->stream>>>(*decoder->huffman_gpu_decoder, scan);
+    // the small-tile limits (sequences of 32 chunks, at most 2048 chunks) place sequence lanes 4 threads apart and
+    // replay one chunk per warp (each measured faster on such tiles, fewer diverging lanes per warp); other limits
+    // keep one chunk per thread
+    if ( small_tile ) {
+        gpujpeg_huffman_decoder_resync_sequence_kernel<2>
+            <<<seq_count, scan.seq_chunks << 2, scan.seq_chunks * 2 * sizeof(uint4), coder->stream>>>(
+                *decoder->huffman_gpu_decoder, scan);
+    }
+    else {
+        gpujpeg_huffman_decoder_resync_sequence_kernel<0>
+            <<<seq_count, scan.seq_chunks, scan.seq_chunks * 2 * sizeof(uint4), coder->stream>>>(
+                *decoder->huffman_gpu_decoder, scan);
+    }
     gpujpeg_huffman_decoder_resync_link_kernel<<<1, link_threads, link_threads * 2 * sizeof(uint4), coder->stream>>>(
         *decoder->huffman_gpu_decoder, scan);
-    gpujpeg_huffman_decoder_resync_replay_kernel<<<gpujpeg_div_and_round_up(scan.chunk_count, RESYNC_REPLAY_THREADS),
-                                                   RESYNC_REPLAY_THREADS, 0, coder->stream>>>(
-        *decoder->huffman_gpu_decoder, scan, coder->d_block_list, coder->d_data_quantized);
+    if ( small_tile ) {
+        gpujpeg_huffman_decoder_resync_replay_kernel<5>
+            <<<gpujpeg_div_and_round_up(scan.chunk_count << 5, RESYNC_REPLAY_THREADS), RESYNC_REPLAY_THREADS, 0,
+               coder->stream>>>(*decoder->huffman_gpu_decoder, scan, coder->d_block_list, coder->d_data_quantized);
+    }
+    else {
+        gpujpeg_huffman_decoder_resync_replay_kernel<0>
+            <<<gpujpeg_div_and_round_up(scan.chunk_count, RESYNC_REPLAY_THREADS), RESYNC_REPLAY_THREADS, 0,
+               coder->stream>>>(*decoder->huffman_gpu_decoder, scan, coder->d_block_list, coder->d_data_quantized);
+    }
     gpujpeg_cuda_check_error("Huffman decoding without restart markers failed", return -1);
 
     struct gpujpeg_huffman_gpu_resync_status status;

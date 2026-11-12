@@ -541,6 +541,17 @@ rs_default_policy(void)
     }
     rs_decode(decoder, &jpeg[0], GPUJPEG_HUFFMAN_ROUTE_RESYNC, 0, "default limits, again");
     RS_CHECK(decoder->huffman_resync_status == 0);
+    // a zero byte after the last block fails certification and triggers a CPU retry; then decode the valid scan
+    // again on the same decoder
+    struct rs_jpeg_desc extra_byte = cases[0];
+    extra_byte.padding = RS_PAD_EXTRA_BYTE;
+    struct rs_jpeg retried = rs_write(&extra_byte);
+    RS_CHECK(retried.scan_size == jpeg[0].scan_size + 1 && retried.scan_size < 64 * 1024);
+    rs_decode(decoder, &retried, GPUJPEG_HUFFMAN_ROUTE_RESYNC_RETRY, GPUJPEG_HUFFMAN_RESYNC_PADDING,
+              "default limits, extra byte");
+    rs_jpeg_free(&retried);
+    rs_decode(decoder, &jpeg[0], GPUJPEG_HUFFMAN_ROUTE_RESYNC, 0, "default limits after retry");
+    RS_CHECK(decoder->huffman_resync_status == 0);
     RS_CHECK(decoder->resync_param.chunk_bytes == defaults.chunk_bytes &&
              decoder->resync_param.seq_chunks == defaults.seq_chunks &&
              decoder->resync_param.repair_rounds == defaults.repair_rounds &&
