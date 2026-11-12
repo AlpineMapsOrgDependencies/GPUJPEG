@@ -1332,9 +1332,9 @@ gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
     }
 
     // Smaller scans than min_bytes keep the CPU decoder, except with exactly the shipped defaults (other values, also
-    // from compile-time overrides, keep their meaning): 256x256 interleaved 4:4:4 scans of at least 32 KiB and less
-    // than 64 KiB use 32-byte chunks in sequences of 32 chunks, measured faster than the CPU decoder for such dense
-    // tiles (4:2:0 and sparse tiles were not).
+    // from compile-time overrides, keep their meaning): 256x256 interleaved 4:4:4 and 4:2:2 scans of at least 32 KiB
+    // and less than 64 KiB use 32-byte chunks in sequences of 32 chunks, measured faster than the CPU decoder for
+    // such dense tiles on RTX 4090 at quality 95 (4:2:0 and sparse tiles were not).
     int chunk_bytes = param->chunk_bytes;
     int seq_chunks = param->seq_chunks;
     bool small_limits = false;
@@ -1342,7 +1342,7 @@ gpujpeg_huffman_gpu_resync_scan_init(const struct gpujpeg_decoder* decoder,
         const bool shipped_defaults = param->chunk_bytes == 512 && param->seq_chunks == 128 &&
                                       param->repair_rounds == 128 && param->min_bytes == 262144;
         if ( !shipped_defaults || coder->param_image.width != 256 || coder->param_image.height != 256 ||
-             mcu_blocks != 3 || size < 32 * 1024 || size >= 64 * 1024 ) {
+             (mcu_blocks != 3 && mcu_blocks != 4) || size < 32 * 1024 || size >= 64 * 1024 ) {
             return false;
         }
         chunk_bytes = 32;
@@ -1428,8 +1428,8 @@ gpujpeg_huffman_gpu_decoder_resync_decode(struct gpujpeg_decoder* decoder)
     const unsigned int seq_count = gpujpeg_div_and_round_up(scan.chunk_count, scan.seq_chunks);
     const unsigned int link_threads = gpujpeg_div_and_round_up(seq_count, 32) * 32;
     // the small-tile limits (sequences of 32 chunks, at most 2048 chunks) place sequence lanes 4 threads apart and
-    // replay one chunk per warp (each measured faster on such tiles, fewer diverging lanes per warp); other limits
-    // keep one chunk per thread
+    // replay one chunk per warp (fewer diverging lanes per warp). The mapping improved 4:4:4 performance; the 4:2:2
+    // path with these limits beat the CPU route. Other limits keep one chunk per thread.
     if ( small_tile ) {
         gpujpeg_huffman_decoder_resync_sequence_kernel<2>
             <<<seq_count, scan.seq_chunks << 2, scan.seq_chunks * 2 * sizeof(uint4), coder->stream>>>(

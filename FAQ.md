@@ -65,14 +65,14 @@ resynchronization on 8-bit baseline images with one sequential scan:
 grayscale, or interleaved 4:4:4, 4:2:2 and 4:2:0. The default minimum is
 256 KiB of entropy-coded scan data; smaller scans retain CPU Huffman
 decoding to avoid GPU setup overhead. The only default exception is a
-256x256 interleaved 4:4:4 image with 32 KiB up to (excluding) 64 KiB of
-scan data, which uses shorter resynchronization chunks: such dense tiles
-were measured to decode faster than with CPU Huffman decoding (RTX 4090,
-quality 95), unlike 4:2:0 or sparse tiles. Scans larger than 64 MiB also
-retain CPU Huffman decoding under the default resource limits. Other
-layout/table restrictions also apply. If bounded resynchronization or
-output validation fails, the decoder retries Huffman decoding on the CPU
-before reconstruction.
+256x256 interleaved 4:4:4 or 4:2:2 image with at least 32 KiB and less
+than 64 KiB of scan data, which uses shorter resynchronization chunks:
+such dense tiles were measured to decode faster than with CPU Huffman
+decoding (RTX 4090, quality 95), unlike 4:2:0 or sparse tiles. Scans larger
+than 64 MiB also retain CPU Huffman decoding under the default resource
+limits. Other layout/table restrictions also apply. If bounded
+resynchronization or output validation fails, the decoder retries Huffman
+decoding on the CPU before reconstruction.
 Restart-marker decoding retains its existing path. Use verbose output
 to see whether resynchronization was selected and whether it retried.
 
