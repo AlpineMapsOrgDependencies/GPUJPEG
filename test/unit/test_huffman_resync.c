@@ -250,18 +250,16 @@ rs_dht(struct rs_buf* b, const struct gpujpeg_table_huffman_encoder* table, int 
     }
 }
 
-static struct rs_jpeg
-rs_write(const struct rs_jpeg_desc* d)
+static void
+rs_tables(struct gpujpeg_table_huffman_encoder table[2][2], bool reversed)
 {
-    // Annex K tables (index 0 luminance, 1 chrominance), optionally with the symbol order reversed
-    struct gpujpeg_table_huffman_encoder table[2][2];
     for ( int index = 0; index < 2; ++index ) {
         for ( int class = 0; class < 2; ++class ) {
             struct gpujpeg_table_huffman_encoder* t = &table[index][class];
             gpujpeg_table_huffman_encoder_init(t,
                                                index == 0 ? GPUJPEG_COMPONENT_LUMINANCE : GPUJPEG_COMPONENT_CHROMINANCE,
                                                class == 0 ? GPUJPEG_HUFFMAN_DC : GPUJPEG_HUFFMAN_AC);
-            if ( d->reversed ) {
+            if ( reversed ) {
                 int count = 0;
                 for ( int length = 1; length <= 16; ++length ) {
                     count += t->bits[length];
@@ -275,6 +273,13 @@ rs_write(const struct rs_jpeg_desc* d)
             }
         }
     }
+}
+
+static struct rs_jpeg
+rs_write(const struct rs_jpeg_desc* d)
+{
+    struct gpujpeg_table_huffman_encoder table[2][2];
+    rs_tables(table, d->reversed);
     int selector[3];
     int max_h = 1;
     int max_v = 1;
@@ -365,6 +370,217 @@ rs_jpeg_free(struct rs_jpeg* jpeg)
 {
     free(jpeg->data);
     free(jpeg->blocks);
+}
+
+/* Host-only entropy fixtures. No decoder_create(), JPEG reader, CUDA allocation,
+ * or CPU-decoder-as-oracle: the writer's generated coefficients are the oracle.
+ * Geometry models the existing block-row layout, including padded edge MCUs.
+ * Segment splitting models the reader's removal of restart markers. */
+static void
+rs_cpu_case(const struct rs_jpeg_desc* d, int interval, bool noninterleaved, bool marker_tail)
+{
+    struct gpujpeg_decoder* decoder = calloc(1, sizeof *decoder);
+    RS_CHECK(decoder != NULL);
+    struct gpujpeg_component components[3] = {0};
+    struct gpujpeg_table_huffman_encoder tables[2][2];
+    rs_tables(tables, d->reversed);
+    for ( int t = 0; t < 2; ++t ) {
+        for ( int type = 0; type < 2; ++type ) {
+            struct gpujpeg_table_huffman_decoder* table = &decoder->table_huffman[t][type];
+            memcpy(table->bits, tables[t][type].bits, sizeof table->bits);
+            memcpy(table->huffval, tables[t][type].huffval, sizeof table->huffval);
+            gpujpeg_table_huffman_decoder_compute(table);
+        }
+    }
+    const int nx = (d->width + 8 * d->sampling[0][0] - 1) / (8 * d->sampling[0][0]);
+    const int ny = (d->height + 8 * d->sampling[0][1] - 1) / (8 * d->sampling[0][1]);
+    const int mcus = nx * ny;
+    if ( interval == 0 )
+        interval = mcus;
+    const int scans = noninterleaved ? d->comp_count : 1;
+    const int segments = (mcus + interval - 1) / interval;
+    decoder->coder.param.comp_count = d->comp_count;
+    decoder->coder.param.interleaved = !noninterleaved;
+    decoder->coder.component = components;
+    decoder->segment_count = scans * segments;
+    decoder->coder.segment = calloc((size_t)decoder->segment_count, sizeof *decoder->coder.segment);
+    RS_CHECK(decoder->coder.segment != NULL);
+    size_t count = 0;
+    for ( int c = 0; c < d->comp_count; ++c ) {
+        struct gpujpeg_component* component = &components[c];
+        component->sampling_factor.horizontal = d->sampling[c][0];
+        component->sampling_factor.vertical = d->sampling[c][1];
+        component->mcu_size_x = 8 * d->sampling[c][0];
+        component->mcu_size = 64 * d->sampling[c][0] * d->sampling[c][1];
+        component->mcu_count_x = nx;
+        component->data_width = nx * component->mcu_size_x;
+        component->segment_mcu_count = interval;
+        component->data_quantized_index = (unsigned)count;
+        count += (size_t)mcus * component->mcu_size;
+        decoder->comp_table_huffman_map[c][0] = decoder->comp_table_huffman_map[c][1] =
+            c == 0 || d->shared_table ? 0 : 1;
+        RS_CHECK(!noninterleaved || component->mcu_size == 64);
+    }
+    int16_t* expected = calloc(count, sizeof *expected);
+    int16_t* actual = malloc(count * sizeof *actual);
+    RS_CHECK(expected != NULL && actual != NULL);
+    for ( int c = 0; c < d->comp_count; ++c )
+        components[c].data_quantized = actual + components[c].data_quantized_index;
+    struct rs_buf bytes = {0};
+    unsigned state = d->seed | 1U;
+    for ( int scan = 0; scan < scans; ++scan ) {
+        for ( int seg = 0; seg < segments; ++seg ) {
+            struct gpujpeg_segment* segment = &decoder->coder.segment[scan * segments + seg];
+            segment->scan_index = scan;
+            segment->scan_segment_index = seg;
+            segment->mcu_count = mcus - seg * interval < interval ? mcus - seg * interval : interval;
+            segment->data_compressed_index = bytes.size;
+            int predictor[3] = {0};
+            struct rs_bits bits = {&bytes, 0, 0};
+            for ( int m = 0; m < segment->mcu_count; ++m ) {
+                int mcu = seg * interval + m;
+                for ( int c = noninterleaved ? scan : 0; c < (noninterleaved ? scan + 1 : d->comp_count); ++c ) {
+                    const int h = d->sampling[c][0], v = d->sampling[c][1];
+                    int t = decoder->comp_table_huffman_map[c][0];
+                    for ( int y = 0; y < v; ++y ) {
+                        for ( int x = 0; x < h; ++x ) {
+                            int16_t z[64];
+                            const int previous = predictor[c];
+                            rs_generate_block(&state, z, &predictor[c]);
+                            if ( mcus == 1 && d->comp_count == 1 ) {
+                                // DC category zero; either a 6-bit empty block
+                                // or 183 bits (23 bytes), forcing late marker rollback.
+                                memset(z, 0, sizeof z);
+                                for ( int k = 1; d->ac_limit == 0 && k < 60; ++k )
+                                    z[k] = 1;
+                                predictor[c] = 0;
+                            }
+                            if ( d->ac_limit > 0 )
+                                memset(z + d->ac_limit, 0, (64 - d->ac_limit) * sizeof *z);
+                            rs_encode_block(&bits, z, z[0] - previous, &tables[t][0], &tables[t][1]);
+                            const int row = (mcu / nx) * v + y, col = (mcu % nx) * h + x;
+                            int16_t* block = expected + components[c].data_quantized_index + (row * nx * h + col) * 64;
+                            for ( int k = 0; k < 64; ++k )
+                                block[gpujpeg_order_natural[k]] = z[k];
+                        }
+                    }
+                }
+            }
+            int pad = (8 - bits.count) % 8;
+            rs_put(&bits, (1U << pad) - 1, pad);
+            if ( marker_tail ) {
+                // Force first-refill or late (after AC stores) marker rollback.
+                RS_CHECK(bytes.size - segment->data_compressed_index == (d->ac_limit ? 1 : 23));
+                rs_word(&bytes, 0xFFD9);
+                for ( int i = 0; i < 512; ++i )
+                    rs_byte(&bytes, 0xA5);
+            }
+            segment->data_compressed_size = bytes.size - segment->data_compressed_index;
+        }
+    }
+    // Exact allocation: ASan can detect a read beyond the final segment.
+    decoder->coder.data_compressed = malloc(bytes.size);
+    RS_CHECK(decoder->coder.data_compressed != NULL);
+    memcpy(decoder->coder.data_compressed, bytes.data, bytes.size);
+    free(bytes.data);
+    if ( mcus > 16 && interval > 16 ) {
+        RS_CHECK(decoder->coder.segment[0].data_compressed_size >= 512); // fast eligible, not tail-only
+        int stuffed = 0;
+        for ( size_t i = 1; i < bytes.size; ++i )
+            stuffed += decoder->coder.data_compressed[i - 1] == 0xFF && decoder->coder.data_compressed[i] == 0;
+        RS_CHECK(stuffed > 0);
+    }
+    for ( int repeat = 0; repeat < 2; ++repeat ) {
+        memset(actual, 0x5A, count * sizeof *actual);
+        RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) == 0);
+        RS_CHECK(memcmp(actual, expected, count * sizeof *actual) == 0);
+    }
+    // Truncation must fail, followed by exact reuse of the same decoder.
+    struct gpujpeg_segment* last = &decoder->coder.segment[decoder->segment_count - 1];
+    size_t saved_size = last->data_compressed_size;
+    last->data_compressed_size = 0;
+    RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+    if ( !marker_tail ) {
+        last->data_compressed_size = saved_size / 2;
+        RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+    }
+    last->data_compressed_size = saved_size;
+    RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) == 0);
+    RS_CHECK(memcmp(actual, expected, count * sizeof *actual) == 0);
+    if ( d->comp_count == 1 && mcus == 1 ) {
+        // Exact-size terminal FF, FF fill, unexpected marker and invalid
+        // 16-bit code. Includes fast marker rollback and long-code rejection.
+        uint8_t* saved_data = decoder->coder.data_compressed;
+        const size_t sizes[] = {1, 2, 511, 512};
+        for ( unsigned i = 0; i < sizeof sizes / sizeof sizes[0]; ++i ) {
+            uint8_t* bad = malloc(sizes[i]);
+            RS_CHECK(bad != NULL);
+            memset(bad, 0xFF, sizes[i]);
+            decoder->coder.data_compressed = bad;
+            last->data_compressed_size = sizes[i];
+            RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+            if ( sizes[i] >= 2 ) {
+                bad[1] = 0xD9;
+                RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+                for ( size_t j = 1; j < sizes[i]; j += 2 )
+                    bad[j] = 0; // all-one code bits, with correct stuffing
+                RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+            }
+            free(bad);
+        }
+        struct rs_buf invalid_run = {0};
+        struct rs_bits bits = {&invalid_run, 0, 0};
+        rs_symbol(&bits, &tables[0][0], 0);
+        for ( int i = 0; i < 4; ++i )
+            rs_symbol(&bits, &tables[0][1], 0xF0); // 64 AC zeros exceed the 63 AC slots
+        int pad = (8 - bits.count) % 8;
+        rs_put(&bits, (1U << pad) - 1, pad);
+        for ( int fast = 0; fast < 2; ++fast ) {
+            if ( fast ) {
+                for ( int i = 0; i < 512; ++i )
+                    rs_byte(&invalid_run, 0);
+            }
+            decoder->coder.data_compressed = invalid_run.data;
+            last->data_compressed_size = invalid_run.size;
+            RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+        }
+        free(invalid_run.data);
+        decoder->coder.data_compressed = saved_data;
+        last->data_compressed_size = saved_size;
+        RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) == 0);
+        RS_CHECK(memcmp(actual, expected, count * sizeof *actual) == 0);
+    }
+    free(decoder->coder.data_compressed);
+    free(decoder->coder.segment);
+    free(actual);
+    free(expected);
+    free(decoder);
+}
+
+static void
+rs_cpu_tests(void)
+{
+    printf("testing CPU Huffman generated coefficients: ");
+    const struct rs_jpeg_desc cases[] = {
+        {131, 77, 1, {{1, 1}},                 false, false, false, false, RS_PAD_ONES, 41, 0},
+        {131, 77, 3, {{1, 1}, {1, 1}, {1, 1}}, false, true,  false, false, RS_PAD_ONES, 43, 0},
+        {131, 77, 3, {{2, 1}, {1, 1}, {1, 1}}, true,  true,  false, false, RS_PAD_ONES, 45, 0},
+        {131, 77, 3, {{2, 2}, {1, 1}, {1, 1}}, true,  false, false, false, RS_PAD_ONES, 47, 0},
+    };
+    for ( unsigned i = 0; i < sizeof cases / sizeof cases[0]; ++i ) {
+        rs_cpu_case(&cases[i], 0, false, false);
+        rs_cpu_case(&cases[i], 8, false, false);
+        rs_cpu_case(&cases[i], 1, false, false);
+    }
+    rs_cpu_case(&cases[1], 0, true, false);
+    rs_cpu_case(&cases[1], 8, true, false);
+    const struct rs_jpeg_desc tiny = {8, 8, 1, {{1, 1}}, false, false, false, false, RS_PAD_ONES, 49, 1};
+    rs_cpu_case(&tiny, 0, false, false);
+    rs_cpu_case(&tiny, 0, false, true);
+    struct rs_jpeg_desc late_marker = tiny;
+    late_marker.ac_limit = 0;
+    rs_cpu_case(&late_marker, 0, false, true);
+    printf("Ok\n");
 }
 
 /// compares the device coefficients with the CPU Huffman decoder and those with the generated ones (if valid)
@@ -601,6 +817,7 @@ test_huffman_resync();
 void
 test_huffman_resync()
 {
+    rs_cpu_tests();
     printf("testing %s: ", __func__);
     if ( getenv("NO_CUDA_DEV") ) {
         printf("--\n");
@@ -694,7 +911,7 @@ test_huffman_resync()
     j = rs_write(&desc);
     rs_decode(decoder, &j, j.pad_bits > 0 ? GPUJPEG_HUFFMAN_ROUTE_RESYNC_RETRY : GPUJPEG_HUFFMAN_ROUTE_RESYNC,
               j.pad_bits > 0 ? GPUJPEG_HUFFMAN_RESYNC_PADDING : 0, "zero padding");
-    // corrupted data (no 0xFF created or removed): any route, still the CPU decoder's coefficients
+    // corrupted data (no 0xFF created or removed): eligible for RESYNC, but CPU rejection is allowed
     for ( size_t pos = j.scan_begin + j.scan_size / 3; pos < j.scan_begin + j.scan_size; ++pos ) {
         const uint8_t value = j.data[pos] ^ 0x5A;
         if ( j.data[pos] != 0xFF && j.data[pos - 1] != 0xFF && value != 0xFF ) {
@@ -704,7 +921,28 @@ test_huffman_resync()
     }
     free(j.blocks);
     j.blocks = NULL;
-    rs_decode(decoder, &j, RS_ROUTE_RESYNC_ANY, 0, "corrupted");
+    // The checked CPU backend may reject malformed codes/runs or truncation
+    // even when the unchanged GPU backend accepts this corrupted stream.
+    struct gpujpeg_decoder_output corrupted_output;
+    gpujpeg_decoder_output_set_default(&corrupted_output);
+    if ( decoder->coder.data_quantized == NULL )
+        RS_CHECK(gpujpeg_coder_allocate_cpu_huffman_buf(&decoder->coder) == 0);
+    decoder->huffman_route = GPUJPEG_HUFFMAN_ROUTE_CPU; // reject an early failure retaining the previous route
+    decoder->huffman_resync_status = 0;
+    const int corrupted_result = gpujpeg_decoder_decode(decoder, j.data, j.size, &corrupted_output);
+    const enum gpujpeg_huffman_route corrupted_route = decoder->huffman_route;
+    RS_CHECK(corrupted_route == GPUJPEG_HUFFMAN_ROUTE_RESYNC || corrupted_route == GPUJPEG_HUFFMAN_ROUTE_RESYNC_RETRY);
+    RS_CHECK(cudaStreamSynchronize(decoder->coder.stream) == cudaSuccess);
+    RS_CHECK(cudaGetLastError() == cudaSuccess);
+    const int corrupted_cpu_result = gpujpeg_huffman_cpu_decoder_decode(decoder);
+    if ( corrupted_cpu_result == 0 ) {
+        RS_CHECK(corrupted_result == 0);
+        rs_check_coefficients(decoder, &j, "corrupted");
+    }
+    else {
+        RS_CHECK(corrupted_result == (corrupted_route == GPUJPEG_HUFFMAN_ROUTE_RESYNC_RETRY ? -1 : 0));
+        RS_CHECK(corrupted_route != GPUJPEG_HUFFMAN_ROUTE_RESYNC_RETRY || decoder->huffman_resync_status != 0);
+    }
     rs_jpeg_free(&j);
     rs_decode(decoder, s420, GPUJPEG_HUFFMAN_ROUTE_RESYNC, 0, "after retries");
     gpujpeg_decoder_destroy(decoder);
