@@ -294,12 +294,19 @@ gpujpeg_huffman_cpu_encoder_encode_mcu(struct gpujpeg_huffman_cpu_encoder* coder
 
 /* Documented at declaration */
 int
-gpujpeg_huffman_cpu_encoder_encode(struct gpujpeg_encoder* encoder)
+gpujpeg_huffman_cpu_encoder_encode(struct gpujpeg_encoder* encoder, size_t image_offset)
 {
+    // Components viewing the coefficients of the image
+    struct gpujpeg_component component[GPUJPEG_MAX_COMPONENT_COUNT];
+    memcpy(component, encoder->coder.component, encoder->coder.param.comp_count * sizeof component[0]);
+    for ( int comp = 0; comp < encoder->coder.param.comp_count; ++comp ) {
+        component[comp].data_quantized += image_offset;
+    }
+
     // Init huffman ecoder
     struct gpujpeg_huffman_cpu_encoder coder;
     coder.writer = encoder->writer;
-    coder.component = encoder->coder.component;
+    coder.component = component;
     
     // Set huffman tables
     for ( int type = 0; type < GPUJPEG_COMPONENT_TYPE_COUNT; type++ ) {

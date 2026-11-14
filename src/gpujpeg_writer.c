@@ -34,6 +34,7 @@
 #include "gpujpeg_marker.h"
 #include "gpujpeg_util.h"
 #include "gpujpeg_writer.h"
+#include <limits.h> // for INT_MAX
 
 #if defined _MSC_VER && _MSC_VER < 1900 // VS 2015
 #define snprintf _snprintf
@@ -67,11 +68,28 @@ gpujpeg_writer_init(struct gpujpeg_writer* writer, int comp_count, struct gpujpe
     size_t buffer_size = 1000;
     buffer_size += (size_t) param_image->width * param_image->height * comp_count * 2;
 
+    if ( gpujpeg_writer_reserve(writer, buffer_size) != 0 ) {
+        return -1;
+    }
+    writer->buffer_current = NULL;
+    writer->segment_info_count = 0;
+    writer->segment_info_index = 0;
+    writer->segment_info_position = 0;
+    return 0;
+}
+
+/* Documented at declaration */
+int
+gpujpeg_writer_reserve(struct gpujpeg_writer* writer, size_t buffer_size)
+{
     if (buffer_size > writer->buffer_allocated_size) {
         writer->buffer_allocated_size = 0;
         free_buffer(writer);
         if ( writer->buffer_pinned ) {
-            cudaMallocHost((void**)&writer->buffer, buffer_size * sizeof(uint8_t));
+            if ( cudaMallocHost((void**)&writer->buffer, buffer_size) != cudaSuccess ) {
+                (void)cudaGetLastError(); // reported by the result
+                writer->buffer = NULL;
+            }
         }
         else {
             writer->buffer = (uint8_t*)malloc(buffer_size * sizeof(uint8_t));
@@ -81,10 +99,6 @@ gpujpeg_writer_init(struct gpujpeg_writer* writer, int comp_count, struct gpujpe
         }
         writer->buffer_allocated_size = buffer_size;
     }
-    writer->buffer_current = NULL;
-    writer->segment_info_count = 0;
-    writer->segment_info_index = 0;
-    writer->segment_info_position = 0;
     return 0;
 }
 
@@ -517,6 +531,53 @@ gpujpeg_writer_write_header(struct gpujpeg_encoder* encoder)
     }
 }
 
+/**
+ * Bound of the bytes gpujpeg_writer_write_header() writes besides Exif: SOI 2, the largest of APP0 18, APP14 16 and
+ * SPIFF header, directory and EOD with SOI 56, at most 2 DQT 2 * 69, SOF 10 + 3 * 4, at most 4 DHT with at most 256
+ * symbols 4 * 277, DRI 6, library comment 36 and color space comment 14 (1390 bytes)
+ */
+#define GPUJPEG_WRITER_HEADER_BOUND 2048
+
+/* Documented at declaration */
+size_t
+gpujpeg_writer_image_size_bound(const struct gpujpeg_encoder* encoder)
+{
+    const struct gpujpeg_coder* coder = &encoder->coder;
+    // headers, entropy-coded segments of at most their compressed data slots (see gpujpeg_coder_init_image()), EOI
+    size_t size = GPUJPEG_WRITER_HEADER_BOUND + coder->data_compressed_size + 2;
+    if ( encoder->header_type == GPUJPEG_HEADER_EXIF ) {
+        const size_t exif_length = gpujpeg_exif_app1_length_bound(encoder->writer->exif_tags);
+        if ( exif_length == 0 || exif_length > 0xFFFF ) {
+            ERROR_MSG("Exif metadata (%zu bytes at most) exceed the APP1 marker!\n", exif_length);
+            return 0;
+        }
+        size += 2 + exif_length;
+    }
+    const int scan_count = coder->param.interleaved == 1 ? 1 : coder->param.comp_count;
+    for ( int scan = 0; scan < scan_count; scan++ ) {
+        size += 2 + 2 + 1 + 2 * GPUJPEG_MAX_COMPONENT_COUNT + 3; // SOS
+        if ( coder->param.segment_info && coder->param.restart_interval > 0 ) {
+            // segment positions and their headers (gpujpeg_writer_write_scan_header())
+            const size_t records =
+                (size_t)(coder->param.interleaved == 1 ? coder->segment_count : coder->component[scan].segment_count) +
+                1;
+            const size_t headers = (4 * records + GPUJPEG_MAX_HEADER_SIZE - 1) / GPUJPEG_MAX_HEADER_SIZE;
+            if ( headers > GPUJPEG_MAX_SEGMENT_INFO_HEADER_COUNT ) {
+                ERROR_MSG("Segment info of %zu segments exceeds %d headers!\n", records - 1,
+                          GPUJPEG_MAX_SEGMENT_INFO_HEADER_COUNT);
+                return 0;
+            }
+            size += headers * (2 + 2 + 1) + 4 * records;
+        }
+    }
+    // segment positions are int (gpujpeg_writer_write_segment_info())
+    if ( coder->param.segment_info && size > INT_MAX ) {
+        ERROR_MSG("Segment info positions exceed the supported range!\n");
+        return 0;
+    }
+    return size;
+}
+
 /* Documented at declaration */
 void
 gpujpeg_writer_write_segment_info(struct gpujpeg_encoder* encoder)
@@ -588,6 +649,7 @@ gpujpeg_writer_write_scan_header(struct gpujpeg_encoder* encoder, int scan_index
             gpujpeg_writer_emit_byte(encoder->writer, scan_index);
 
             // Set pointer to current segment info data block, where segment positions will be placed
+            assert(encoder->writer->segment_info_count < GPUJPEG_MAX_SEGMENT_INFO_HEADER_COUNT);
             encoder->writer->segment_info[encoder->writer->segment_info_count] = encoder->writer->buffer_current;
 
             // Prepare size for segment info data
@@ -595,7 +657,6 @@ gpujpeg_writer_write_scan_header(struct gpujpeg_encoder* encoder, int scan_index
 
             // Increase header count
             encoder->writer->segment_info_count++;
-            assert(encoder->writer->segment_info_count < GPUJPEG_MAX_SEGMENT_INFO_HEADER_COUNT);
         }
     }
 

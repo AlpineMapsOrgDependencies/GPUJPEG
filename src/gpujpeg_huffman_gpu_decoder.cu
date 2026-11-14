@@ -590,14 +590,18 @@ gpujpeg_huffman_gpu_decoder_table_setup(
     //      - number of run-length-coded preceding zeros (up to 16, or 63 for both special end-of block symbol or invalid codewords)
     //      - bit-size of the actual value of coefficient (up to 16, 0 for invalid ones)
     int code_nbits = 1, category_id = 0;
-    
-    // First, decode codeword length (This is per Figure F.16 in the JPEG spec.)
+
+    // First, decode codeword length (This is per Figure F.16 in the JPEG spec.), at most 16 bits (an incomplete or
+    // zeroed unused table has no code for some bit sequences)
     int code_value = bits >> 15; // only single bit initially
     while ( code_value > d_table_src->maxcode[code_nbits] ) {
-        code_value = bits >> (16 - ++code_nbits); // not enough to decide => try more bits
+        if ( ++code_nbits > 16 ) {
+            break;
+        }
+        code_value = bits >> (16 - code_nbits); // not enough to decide => try more bits
     }
-    
-    // With garbage input we may reach the sentinel value l = 17.
+
+    // Invalid code (no symbol of at most 16 bits).
     if ( code_nbits > 16 ) {
         code_nbits = 0;
         // category ID remains 0 for invalid symbols from garbage input
@@ -726,7 +730,7 @@ gpujpeg_huffman_gpu_decoder_build_tables(struct gpujpeg_decoder* decoder, int ta
 
 /* Documented at declaration */
 int
-gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder)
+gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder, bool block_list)
 {    
     // Get coder
     struct gpujpeg_coder* coder = &decoder->coder;
@@ -758,12 +762,12 @@ gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder)
     // Copy updated components to device memory
     cudaMemcpyAsync(coder->d_component, coder->component, coder->param.comp_count * sizeof(struct gpujpeg_component),
                     cudaMemcpyHostToDevice, coder->stream);
-    gpujpeg_cuda_check_error("Coder component copy", return 0);
-    
+    gpujpeg_cuda_check_error("Coder component copy", return -1);
+
     // Run decoding kernel
     dim3 thread(THREADS_PER_TBLOCK);
     dim3 grid(gpujpeg_div_and_round_up(decoder->segment_count, THREADS_PER_TBLOCK));
-    if(comp_count == 1) {
+    if ( comp_count == 1 && !block_list ) {
         gpujpeg_huffman_decoder_decode_kernel<true, THREADS_PER_TBLOCK><<<grid, thread, 0, coder->stream>>>(
             *decoder->huffman_gpu_decoder,
             coder->d_component, 
@@ -774,7 +778,8 @@ gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder)
             coder->d_block_list,
             coder->d_data_quantized
         );
-    } else {
+    }
+    else {
         gpujpeg_huffman_decoder_decode_kernel<false, THREADS_PER_TBLOCK><<<grid, thread, 0, coder->stream>>>(
             *decoder->huffman_gpu_decoder,
             coder->d_component, 

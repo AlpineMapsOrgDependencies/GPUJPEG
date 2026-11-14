@@ -62,6 +62,10 @@ struct gpujpeg_encoder
 
     /// JPEG header to be emitted
     enum gpujpeg_header_type header_type;
+
+    /// image sizes of gpujpeg_encoder_encode_batch() before they are returned
+    size_t* batch_sizes;
+    int batch_sizes_capacity;
 };
 
 #ifdef __cplusplus

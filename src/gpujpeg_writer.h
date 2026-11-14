@@ -87,6 +87,26 @@ int
 gpujpeg_writer_init(struct gpujpeg_writer* writer, int comp_count, struct gpujpeg_image_parameters* param_image);
 
 /**
+ * Ensure that the writer buffer holds at least buffer_size bytes (its content is not kept)
+ *
+ * @return 0 if succeeds, otherwise nonzero
+ */
+int
+gpujpeg_writer_reserve(struct gpujpeg_writer* writer, size_t buffer_size);
+
+/**
+ * Upper bound of the bytes of one image written by the encoder with its current configuration: headers including
+ * Exif and segment info, entropy-coded data and EOI. The entropy-coded data are bounded by the segment slots of the
+ * coder (gpujpeg_coder::data_compressed_size), which hold any segment of coefficients the encoder generates from 8-bit
+ * samples with nonzero quantizers (at most 418 bytes per block with byte stuffing, slots reserve 512).
+ *
+ * @return the bound, 0 if the configuration cannot be written (Exif beyond its APP1 marker, segment info beyond
+ *         GPUJPEG_MAX_SEGMENT_INFO_HEADER_COUNT headers or int positions)
+ */
+size_t
+gpujpeg_writer_image_size_bound(const struct gpujpeg_encoder* encoder);
+
+/**
  * Destroy JPEG writer
  *
  * @param writer  Writer structure

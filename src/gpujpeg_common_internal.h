@@ -393,10 +393,17 @@ struct gpujpeg_coder
     /// Allocated size
     size_t data_allocated_size;
 
+    /// Images the layout (segments, block list and buffers) is built for by gpujpeg_coder_init_image(), 0 while it
+    /// is not usable (not built or its rebuild failed)
+    int image_capacity;
+    bool layout_batch;        ///< the layout satisfies the batch limits (gpujpeg_coder_init_image() batch)
+    size_t image_data_stride; ///< d_data and d_data_quantized elements from an image to the next one in a batch
+    bool data_padding_dirty;  ///< encoder: d_data of the first image may be nonzero outside the image (flipped)
+
     /// Huffman coder data in host memory (output/input for encoder/decoder)
     /// only **partially** pinned (needs special treatment - @sa gpujpeg_cuda_memcpy_async_partially_pinned)
     uint8_t* data_compressed;
-    size_t data_compressed_pinned_sz; ///< amount of pinned memory from data_compressed
+    size_t data_compressed_pinned_sz; ///< amount of pinned (registered) memory from data_compressed, 0 if none
     /// Huffman coder data in device memory (output/input for encoder/decoder)
     uint8_t* d_data_compressed;
     /// Huffman coder temporary data (in device memory only)
@@ -447,14 +454,23 @@ gpujpeg_coder_init(struct gpujpeg_coder* coder);
 /**
  * Initialize JPEG coder (allocate buffers and initialize structures)
  *
+ * Image k of a batch uses segments [k * segment_count, (k + 1) * segment_count), blocks
+ * [k * block_count, (k + 1) * block_count), elements from k * image_data_stride of d_data and d_data_quantized and
+ * compressed bytes from k * data_compressed_size (segment slots of the encoder).
+ *
  * @param codec        Codec structure
  * @param param
  * @param param_image
+ * @param image_count  images the layout holds (1 for the single-image API)
+ * @param batch        apply the batch limits (also for 1 image); a decoder then uploads segments and components
+ *                     itself once they are final
  * @param stream       CUDA stream
  * @return size of allocated device memory in bytes if succeeds, otherwise 0
  */
 size_t
-gpujpeg_coder_init_image(struct gpujpeg_coder * coder, const struct gpujpeg_parameters * param, const struct gpujpeg_image_parameters * param_image, cudaStream_t stream);
+gpujpeg_coder_init_image(struct gpujpeg_coder* coder, const struct gpujpeg_parameters* param,
+                         const struct gpujpeg_image_parameters* param_image, int image_count, bool batch,
+                         cudaStream_t stream);
 
 /**
  * @brief allocate buffers for CPU Huffman coder

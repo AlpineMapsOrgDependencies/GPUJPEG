@@ -34,6 +34,7 @@
 #ifndef __cplusplus
 #include <stdbool.h>
 #endif
+#include <stddef.h> // for size_t
 
 #include "../libgpujpeg/gpujpeg_type.h"
 
@@ -44,6 +45,8 @@ extern "C" {
 
 struct gpujpeg_coder;
 struct gpujpeg_encoder;
+struct gpujpeg_image_parameters;
+struct gpujpeg_parameters;
 
 /**
  * Preprocessor/postprocessor data for component
@@ -89,17 +92,29 @@ int
 gpujpeg_preprocessor_encoder_init(struct gpujpeg_coder* coder);
 
 /**
+ * How the encoder preprocessor processes images with the parameters (as adjusted for the coder)
+ *
+ * @retval 0  the planes are copied
+ * @retval 1  a kernel converts the samples
+ * @retval -1 no kernel for the color space is compiled in (GPUJPEG_YUV without ENABLE_YUV)
+ */
+int
+gpujpeg_preprocessor_encode_route(const struct gpujpeg_parameters* param,
+                                  const struct gpujpeg_image_parameters* param_image);
+
+/**
  * Preprocessor encode
  *
- * @param encoder  Encoder structure
- * @param image  Image source data
+ * @param encoder      Encoder structure
+ * @param image_count  images of the batch (coder.image_data_stride apart in the components), 1 for a single image
+ * @param raw_stride   bytes of coder.d_data_raw from an image to the next one
  * @return 0 if succeeds, otherwise nonzero
  * @retval  0 if succeeds
  * @retval -1 general error
  * @retval -2 planar pixel format cannot be encoded with specified subsampling
  */
 int
-gpujpeg_preprocessor_encode(struct gpujpeg_encoder * encoder);
+gpujpeg_preprocessor_encode(struct gpujpeg_encoder* encoder, int image_count, size_t raw_stride);
 
 // shared with postprocess
 int

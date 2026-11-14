@@ -1,6 +1,26 @@
 unreleased
 ----------
 
+- add gpujpeg_decoder_decode_batch() decoding images with equal coding settings
+together (each GPU stage once for all of them) to strided host or CUDA
+buffers, with errors GPUJPEG_ERR_BATCH_MISMATCH and
+GPUJPEG_ERR_BATCH_UNSUPPORTED
+
+- add gpujpeg_encoder_encode_batch() encoding strided host or CUDA images with
+one configuration together to JPEGs stored one after another
+
+- fixed Exif written by the encoder (also gpujpeg_encoder_encode()): the Exif
+IFD pointer was read after its lifetime (invalid in optimized builds) and
+missed custom 0th IFD tag values; releasing several custom Exif tags
+
+- the decoder rejects malformed JPEG headers that could previously cause
+undefined behavior or an abort (also gpujpeg_decoder_decode()): table indices
+above 3, Huffman tables with more than 256 or invalid codes or exceeding
+their marker, too short SOF markers, zero sampling factors, 2 components,
+zero image size, scans with empty Huffman tables, marker lengths below 2 and
+scans with more restart segments or data than the decoder holds; a failed
+(re)initialization of a coder is retried by the next call
+
 - add GPU Huffman resynchronization for eligible single-scan baseline JPEGs
 without restart markers, with bounded CPU fallback and a 256 KiB scan cutoff
 (by default also 256x256 interleaved 4:4:4 or 4:2:2 scans of at least

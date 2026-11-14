@@ -385,11 +385,19 @@ gpujpeg_huffman_cpu_decoder_decode_mcu(struct gpujpeg_huffman_cpu_decoder* coder
 
 /* Documented at declaration */
 int
-gpujpeg_huffman_cpu_decoder_decode(struct gpujpeg_decoder* decoder)
+gpujpeg_huffman_cpu_decoder_decode(struct gpujpeg_decoder* decoder, int segment_begin, int segment_count,
+                                   size_t image_offset)
 {
+    // Components viewing the coefficients of the image (compressed data indices of the segments are absolute)
+    struct gpujpeg_component component[GPUJPEG_MAX_COMPONENT_COUNT];
+    memcpy(component, decoder->coder.component, decoder->coder.param.comp_count * sizeof component[0]);
+    for ( int comp = 0; comp < decoder->coder.param.comp_count; ++comp ) {
+        component[comp].data_quantized += image_offset;
+    }
+
     // Initialize huffman coder
     struct gpujpeg_huffman_cpu_decoder coder;
-    coder.component = decoder->coder.component;
+    coder.component = component;
     coder.scan_index = -1;
 
     // Derive only referenced tables: unused decoder slots may be uninitialized.
@@ -417,7 +425,7 @@ gpujpeg_huffman_cpu_decoder_decode(struct gpujpeg_decoder* decoder)
     assert(coder.comp_count >= 1 && coder.comp_count <= GPUJPEG_MAX_COMPONENT_COUNT);
     
     // Decode all segments
-    for ( int segment_index = 0; segment_index < decoder->segment_count; segment_index++ ) {
+    for ( int segment_index = segment_begin; segment_index < segment_begin + segment_count; segment_index++ ) {
         // Get segment structure
         struct gpujpeg_segment* segment = &decoder->coder.segment[segment_index];
         
@@ -442,7 +450,7 @@ gpujpeg_huffman_cpu_decoder_decode(struct gpujpeg_decoder* decoder)
             }
         }
     }
-    
+
     return 0;
 }
 

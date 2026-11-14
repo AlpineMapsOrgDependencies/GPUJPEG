@@ -42,17 +42,19 @@ extern "C" {
  * Peform forward DCT on GPU in integers
  *
  * @param decoder
+ * @param image_count  images of the batch (coder.image_data_stride apart), 1 for a single image
  */
 int
-gpujpeg_dct_gpu(struct gpujpeg_encoder* encoder);
+gpujpeg_dct_gpu(struct gpujpeg_encoder* encoder, int image_count);
 
 /**
  * Peform inverse DCT on GPU in integers
  *
  * @param decoder
+ * @param image_count  images of the batch (coder.image_data_stride apart), 1 for a single image
  */
 int
-gpujpeg_idct_gpu(struct gpujpeg_decoder* decoder);
+gpujpeg_idct_gpu(struct gpujpeg_decoder* decoder, int image_count);
 
 #ifdef __cplusplus
 }

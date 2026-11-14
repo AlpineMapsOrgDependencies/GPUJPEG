@@ -74,7 +74,12 @@ extern "C" {
 #define GPUJPEG_NOERR                           0
 #define GPUJPEG_ERROR                           (-1)
 #define GPUJPEG_ERR_RESTART_CHANGE              (-2)
+#define GPUJPEG_ERR_BATCH_MISMATCH (-3)    ///< coding settings of a batch image differ from the first image
+#define GPUJPEG_ERR_BATCH_UNSUPPORTED (-4) ///< supported by the single-image API, but not in a batch
 /// @}
+
+/// maximal image count of a batch (an upper bound only, sizes and memory may limit it more)
+#define GPUJPEG_BATCH_MAX_COUNT 65535
 
 #define GPUJPEG_VAL_TRUE  "1"
 #define GPUJPEG_VAL_FALSE "0"

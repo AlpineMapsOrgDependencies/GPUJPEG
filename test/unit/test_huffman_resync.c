@@ -492,20 +492,20 @@ rs_cpu_case(const struct rs_jpeg_desc* d, int interval, bool noninterleaved, boo
     }
     for ( int repeat = 0; repeat < 2; ++repeat ) {
         memset(actual, 0x5A, count * sizeof *actual);
-        RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) == 0);
+        RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) == 0);
         RS_CHECK(memcmp(actual, expected, count * sizeof *actual) == 0);
     }
     // Truncation must fail, followed by exact reuse of the same decoder.
     struct gpujpeg_segment* last = &decoder->coder.segment[decoder->segment_count - 1];
     size_t saved_size = last->data_compressed_size;
     last->data_compressed_size = 0;
-    RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+    RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) != 0);
     if ( !marker_tail ) {
         last->data_compressed_size = saved_size / 2;
-        RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+        RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) != 0);
     }
     last->data_compressed_size = saved_size;
-    RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) == 0);
+    RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) == 0);
     RS_CHECK(memcmp(actual, expected, count * sizeof *actual) == 0);
     if ( d->comp_count == 1 && mcus == 1 ) {
         // Exact-size terminal FF, FF fill, unexpected marker and invalid
@@ -518,13 +518,13 @@ rs_cpu_case(const struct rs_jpeg_desc* d, int interval, bool noninterleaved, boo
             memset(bad, 0xFF, sizes[i]);
             decoder->coder.data_compressed = bad;
             last->data_compressed_size = sizes[i];
-            RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+            RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) != 0);
             if ( sizes[i] >= 2 ) {
                 bad[1] = 0xD9;
-                RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+                RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) != 0);
                 for ( size_t j = 1; j < sizes[i]; j += 2 )
                     bad[j] = 0; // all-one code bits, with correct stuffing
-                RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+                RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) != 0);
             }
             free(bad);
         }
@@ -542,12 +542,12 @@ rs_cpu_case(const struct rs_jpeg_desc* d, int interval, bool noninterleaved, boo
             }
             decoder->coder.data_compressed = invalid_run.data;
             last->data_compressed_size = invalid_run.size;
-            RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) != 0);
+            RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) != 0);
         }
         free(invalid_run.data);
         decoder->coder.data_compressed = saved_data;
         last->data_compressed_size = saved_size;
-        RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) == 0);
+        RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) == 0);
         RS_CHECK(memcmp(actual, expected, count * sizeof *actual) == 0);
     }
     free(decoder->coder.data_compressed);
@@ -595,7 +595,7 @@ rs_check_coefficients(struct gpujpeg_decoder* decoder, const struct rs_jpeg* jpe
     if ( coder->data_quantized == NULL ) {
         RS_CHECK(gpujpeg_coder_allocate_cpu_huffman_buf(coder) == 0);
     }
-    RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder) == 0);
+    RS_CHECK(gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) == 0);
     for ( size_t i = 0; i < count; ++i ) {
         if ( gpu[i] != coder->data_quantized[i] ) {
             fprintf(stderr, "%s: coefficient %zu of %zu is %d, CPU decoder %d!\n", name, i, count, gpu[i],
@@ -934,7 +934,7 @@ test_huffman_resync()
     RS_CHECK(corrupted_route == GPUJPEG_HUFFMAN_ROUTE_RESYNC || corrupted_route == GPUJPEG_HUFFMAN_ROUTE_RESYNC_RETRY);
     RS_CHECK(cudaStreamSynchronize(decoder->coder.stream) == cudaSuccess);
     RS_CHECK(cudaGetLastError() == cudaSuccess);
-    const int corrupted_cpu_result = gpujpeg_huffman_cpu_decoder_decode(decoder);
+    const int corrupted_cpu_result = gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0);
     if ( corrupted_cpu_result == 0 ) {
         RS_CHECK(corrupted_result == 0);
         rs_check_coefficients(decoder, &j, "corrupted");

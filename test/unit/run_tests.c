@@ -100,6 +100,10 @@ test_concurrency();
 void
 test_allocator();
 
+// defined in test_batch.c
+void
+test_batch();
+
 // defined in test_huffman_resync.c
 void
 test_huffman_resync();
@@ -152,6 +156,7 @@ int main() {
         test_concurrency();
         test_allocator();
         test_huffman_resync();
+        test_batch();
         printf("PASSED\n");
 }
 

@@ -40,6 +40,7 @@
 #include "gpujpeg_reader.h"
 #include "gpujpeg_util.h"
 #include "utils/image_delegate.h" //  for image_delegate_stbi_tga_set_rle
+#include <stdint.h>               // for PTRDIFF_MAX, SIZE_MAX
 
 /* Documented at declaration */
 void
@@ -205,20 +206,10 @@ gpujpeg_decoder_create_with_allocator(const struct gpujpeg_decoder_init_paramete
     return decoder;
 }
 
-/* Documented at declaration */
-int
-gpujpeg_decoder_init(struct gpujpeg_decoder* decoder, const struct gpujpeg_parameters* param, const struct gpujpeg_image_parameters* param_image)
+bool
+gpujpeg_decoder_layout_differs(const struct gpujpeg_coder* coder, const struct gpujpeg_parameters* param,
+                               const struct gpujpeg_image_parameters* param_image)
 {
-    // Get coder
-    struct gpujpeg_coder* coder = &decoder->coder;
-
-    coder->param.verbose = param->verbose;
-    coder->param.perf_stats = param->perf_stats || param->verbose >= GPUJPEG_LL_STATUS;
-    if (param_image->width * param_image->height * param->comp_count == 0) {
-        return 0;
-    }
-
-    // Check if (re)inialization is needed
     int change = 0;
     change |= coder->param_image.width != param_image->width;
     change |= coder->param_image.width_padding != param_image->width_padding;
@@ -233,21 +224,49 @@ gpujpeg_decoder_init(struct gpujpeg_decoder* decoder, const struct gpujpeg_param
         change |= coder->param.sampling_factor[comp].horizontal != param->sampling_factor[comp].horizontal;
         change |= coder->param.sampling_factor[comp].vertical != param->sampling_factor[comp].vertical;
     }
-    if ( change == 0 )
+    return change != 0;
+}
+
+/* Documented at declaration */
+int
+gpujpeg_decoder_init(struct gpujpeg_decoder* decoder, const struct gpujpeg_parameters* param,
+                     const struct gpujpeg_image_parameters* param_image)
+{
+    return gpujpeg_decoder_init_layout(decoder, param, param_image, 1, false);
+}
+
+int
+gpujpeg_decoder_init_layout(struct gpujpeg_decoder* decoder, const struct gpujpeg_parameters* param,
+                            const struct gpujpeg_image_parameters* param_image, int image_count, bool batch)
+{
+    // Get coder
+    struct gpujpeg_coder* coder = &decoder->coder;
+
+    coder->param.verbose = param->verbose;
+    coder->param.perf_stats = param->perf_stats || param->verbose >= GPUJPEG_LL_STATUS;
+    if ( param_image->width == 0 || param_image->height == 0 || param->comp_count == 0 ) {
         return 0;
+    }
+
+    // Check if (re)inialization is needed (also after a failed one)
+    if ( !gpujpeg_decoder_layout_differs(coder, param, param_image) && coder->image_capacity >= image_count &&
+         (!batch || coder->layout_batch) ) {
+        return 0;
+    }
 
     if ( coder->param.verbose >= GPUJPEG_LL_INFO &&
          (coder->param_image.width != 0 || coder->param_image.height != 0 || coder->param.comp_count != 0) ) {
         fprintf(stderr, "[GPUJPEG] [Info] Reinitializing decoder.\n");
     }
 
-    if (0 == gpujpeg_coder_init_image(coder, param, param_image, coder->stream)) {
+    if ( 0 == gpujpeg_coder_init_image(coder, param, param_image, image_count, batch, coder->stream) ) {
         fprintf(stderr, "[GPUJPEG] [Error] Failed to init coder image!\n");
         return -1;
     }
 
-    // Init postprocessor
+    // Init postprocessor (also its copies of the component buffer pointers)
     if ( gpujpeg_postprocessor_decoder_init(&decoder->coder) != 0 ) {
+        coder->image_capacity = 0;
         fprintf(stderr, "[GPUJPEG] [Error] Failed to init postprocessor!\n");
         return -1;
     }
@@ -273,7 +292,7 @@ decode_huffman_cpu(struct gpujpeg_decoder* decoder)
             return -1;
         }
     }
-    if (0 != gpujpeg_huffman_cpu_decoder_decode(decoder)) {
+    if ( 0 != gpujpeg_huffman_cpu_decoder_decode(decoder, 0, decoder->segment_count, 0) ) {
         fprintf(stderr, "[GPUJPEG] [Error] Huffman decoder failed!\n");
         return -1;
     }
@@ -288,6 +307,83 @@ decode_huffman_cpu(struct gpujpeg_decoder* decoder)
     return 0;
 }
 
+/**
+ * Uploads the tables committed on host by batch reading (gpujpeg_decoder_batch::quant_dirty, huffman_dirty)
+ *
+ * @return 0 if succeeds, otherwise nonzero
+ */
+static int
+decoder_upload_tables(struct gpujpeg_decoder* decoder)
+{
+    for ( int index = 0; index < GPUJPEG_MAX_COMPONENT_COUNT; index++ ) {
+        if ( (decoder->batch.quant_dirty & (1U << index)) != 0 &&
+             gpujpeg_table_quantization_decoder_compute(&decoder->table_quantization[index], decoder->coder.stream) !=
+                 0 ) {
+            return -1;
+        }
+        for ( int type = 0; type < GPUJPEG_HUFFMAN_TYPE_COUNT; type++ ) {
+            if ( (decoder->batch.huffman_dirty & (1U << (index * 2 + type))) != 0 &&
+                 cudaMemcpyAsync(decoder->d_table_huffman[index][type], &decoder->table_huffman[index][type],
+                                 sizeof(struct gpujpeg_table_huffman_decoder), cudaMemcpyHostToDevice,
+                                 decoder->coder.stream) != cudaSuccess ) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/**
+ * Uploads the tables committed by batch reading and waits for the stream (completing also other queued work), so
+ * that device tables match the host ones for a following image that inherits them
+ *
+ * @return 0 if succeeds (the table masks are cleared), otherwise nonzero
+ */
+static int
+decoder_flush_tables(struct gpujpeg_decoder* decoder)
+{
+    const int upload_rc = decoder_upload_tables(decoder);
+    const cudaError_t sync_rc = cudaStreamSynchronize(decoder->coder.stream); // also after a failed upload
+    if ( upload_rc != 0 || sync_rc != cudaSuccess ) {
+        const cudaError_t last_error = cudaGetLastError();
+        ERROR_MSG("Decoder table upload or stream completion failed: %s!\n",
+                  cudaGetErrorString(sync_rc != cudaSuccess ? sync_rc : last_error));
+        return -1;
+    }
+    decoder->batch.quant_dirty = 0;
+    decoder->batch.huffman_dirty = 0;
+    return 0;
+}
+
+/**
+ * (Re)allocates internal raw buffers (pinned host and device) of at least size bytes
+ *
+ * @return 0 if succeeds, otherwise nonzero
+ */
+static int
+decoder_ensure_raw(struct gpujpeg_coder* coder, size_t size)
+{
+    if ( size <= coder->data_raw_allocated_size ) {
+        return 0;
+    }
+    coder->data_raw_allocated_size = 0;
+
+    // (Re)allocate raw data in host memory
+    if ( coder->data_raw != NULL ) {
+        cudaFreeHost(coder->data_raw);
+    }
+    coder->data_raw = NULL;
+    cudaMallocHost((void**)&coder->data_raw, size * sizeof(uint8_t));
+    gpujpeg_cuda_check_error("Decoder raw data allocation", coder->data_raw = NULL; return -1);
+    // (Re)allocate raw data in device memory
+    gpujpeg_coder_device_free(coder, coder->d_data_raw_allocated);
+    if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_data_raw_allocated, size) != 0 ) {
+        return -1;
+    }
+    coder->data_raw_allocated_size = size;
+    return 0;
+}
+
 /* Documented at declaration */
 int
 gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t image_size, struct gpujpeg_decoder_output* output)
@@ -298,6 +394,11 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
     bool use_cpu_huffman_decoder = false;
 
     coder->start_time = coder->param.perf_stats ? gpujpeg_get_time() : 0;
+
+    // tables of a failed batch the image may inherit
+    if ( (decoder->batch.quant_dirty | decoder->batch.huffman_dirty) != 0 && decoder_flush_tables(decoder) != 0 ) {
+        return -1;
+    }
 
     GPUJPEG_CUSTOM_TIMER_START(coder->duration_stream, coder->param.perf_stats, coder->stream, return -1);
 
@@ -369,7 +470,8 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
         GPUJPEG_CUSTOM_TIMER_START(coder->duration_in_gpu, coder->param.perf_stats, coder->stream, return -1);
         GPUJPEG_CUSTOM_TIMER_START(coder->duration_huffman_coder, coder->param.perf_stats, coder->stream, return -1);
         // Perform huffman decoding
-        rc = resync ? gpujpeg_huffman_gpu_decoder_resync_decode(decoder) : gpujpeg_huffman_gpu_decoder_decode(decoder);
+        rc = resync ? gpujpeg_huffman_gpu_decoder_resync_decode(decoder)
+                    : gpujpeg_huffman_gpu_decoder_decode(decoder, false);
         if ( rc < 0 ) {
             fprintf(stderr, "[GPUJPEG] [Error] Huffman decoder on GPU failed!\n");
             return -1;
@@ -390,7 +492,7 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
     GPUJPEG_CUSTOM_TIMER_START(coder->duration_dct_quantization, coder->param.perf_stats, coder->stream, return -1);
 
     // Perform IDCT and dequantization (own CUDA implementation)
-    if (0 != gpujpeg_idct_gpu(decoder)) {
+    if ( 0 != gpujpeg_idct_gpu(decoder, 1) ) {
         return -1;
     }
     // gpujpeg_idct_cpu(decoder);
@@ -398,22 +500,8 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
     GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_dct_quantization, coder->param.perf_stats, coder->stream, return -1);
 
     // Reallocate buffers if not enough size
-    if ( coder->data_raw_size > coder->data_raw_allocated_size ) {
-        coder->data_raw_allocated_size = 0;
-
-        // (Re)allocate raw data in host memory
-        if ( coder->data_raw != NULL ) {
-            cudaFreeHost(coder->data_raw);
-        }
-        coder->data_raw = NULL;
-        cudaMallocHost((void**)&coder->data_raw, coder->data_raw_size * sizeof(uint8_t));
-        gpujpeg_cuda_check_error("Decoder raw data allocation", return -1);
-        // (Re)allocate raw data in device memory
-        gpujpeg_coder_device_free(coder, coder->d_data_raw_allocated);
-        if ( gpujpeg_coder_device_alloc(coder, (void**)&coder->d_data_raw_allocated, coder->data_raw_size) != 0 ) {
-            return -1;
-        }
-        coder->data_raw_allocated_size = coder->data_raw_size;
+    if ( decoder_ensure_raw(coder, coder->data_raw_size) != 0 ) {
+        return -1;
     }
 
     // Select CUDA output buffer
@@ -439,7 +527,7 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
 
     // Postprocessing
     GPUJPEG_CUSTOM_TIMER_START(coder->duration_preprocessor, coder->param.perf_stats, coder->stream, return -1);
-    rc = gpujpeg_postprocessor_decode(&decoder->coder, coder->stream);
+    rc = gpujpeg_postprocessor_decode(&decoder->coder, coder->stream, 1, 0);
     if (rc != GPUJPEG_NOERR) {
         return rc;
     }
@@ -538,6 +626,274 @@ gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t i
     return 0;
 }
 
+/**
+ * Validates the arguments of gpujpeg_decoder_decode_batch() that do not depend on the images
+ *
+ * @retval @ref Errors
+ */
+static int
+decoder_batch_check_args(struct gpujpeg_decoder* decoder, int count, uint8_t* const* images, const size_t* image_sizes,
+                         const struct gpujpeg_decoder_output* output, int* error_index)
+{
+    if ( decoder == NULL || images == NULL || image_sizes == NULL || output == NULL || count < 1 ||
+         count > GPUJPEG_BATCH_MAX_COUNT ) {
+        ERROR_MSG("Invalid batch decoding arguments!\n");
+        return GPUJPEG_ERROR;
+    }
+    switch ( output->type ) {
+    case GPUJPEG_DECODER_OUTPUT_INTERNAL_BUFFER:
+    case GPUJPEG_DECODER_OUTPUT_CUDA_BUFFER:
+        break;
+    case GPUJPEG_DECODER_OUTPUT_CUSTOM_BUFFER:
+    case GPUJPEG_DECODER_OUTPUT_CUSTOM_CUDA_BUFFER:
+        if ( output->data == NULL ) {
+            ERROR_MSG("Custom buffer for batch decoding not set!\n");
+            return GPUJPEG_ERROR;
+        }
+        break;
+    case GPUJPEG_DECODER_OUTPUT_OPENGL_TEXTURE:
+        ERROR_MSG("OpenGL texture output is not supported for batches!\n");
+        return GPUJPEG_ERR_BATCH_UNSUPPORTED;
+    default:
+        ERROR_MSG("Invalid decoder output type %d!\n", (int)output->type);
+        return GPUJPEG_ERROR;
+    }
+    if ( decoder->coder.preprocessor.flipped || decoder->coder.preprocessor.channel_remap != 0 ) {
+        ERROR_MSG("Flipping and channel remapping are not supported for batches!\n");
+        return GPUJPEG_ERR_BATCH_UNSUPPORTED;
+    }
+    // requested output format (the setters do not validate it), checked before the helpers assuming it valid
+    const enum gpujpeg_pixel_format pixel_format = decoder->req_pixel_format;
+    const enum gpujpeg_color_space color_space = decoder->req_color_space;
+    if ( (gpujpeg_pixel_format_get_comp_count(pixel_format) == 0 && pixel_format != GPUJPEG_PIXFMT_AUTODETECT &&
+          pixel_format != GPUJPEG_PIXFMT_NO_ALPHA && pixel_format != GPUJPEG_PIXFMT_STD &&
+          pixel_format != GPUJPEG_PIXFMT_NATIVE) ||
+         (color_space != GPUJPEG_NONE && color_space != GPUJPEG_CS_DEFAULT &&
+          (color_space < GPUJPEG_RGB || color_space > GPUJPEG_YUV)) ||
+         decoder->req_alignment < 0 ) {
+        ERROR_MSG("Invalid decoder output format or alignment for batch decoding!\n");
+        return GPUJPEG_ERROR;
+    }
+    if ( decoder->req_alignment > GPUJPEG_DECODER_BATCH_MAX_ALIGNMENT ) {
+        ERROR_MSG("Output alignment %d is not supported for batches (at most %d)!\n", decoder->req_alignment,
+                  GPUJPEG_DECODER_BATCH_MAX_ALIGNMENT);
+        return GPUJPEG_ERR_BATCH_UNSUPPORTED;
+    }
+    for ( int i = 0; i < count; i++ ) {
+        // SOI + EOI at least, image end representable as a pointer difference
+        if ( images[i] == NULL || image_sizes[i] < 4 || image_sizes[i] > (size_t)PTRDIFF_MAX ) {
+            ERROR_MSG("Invalid batch image %d (%zu bytes)!\n", i, image_sizes[i]);
+            *error_index = i;
+            return GPUJPEG_ERROR;
+        }
+    }
+    return GPUJPEG_NOERR;
+}
+
+/* Documented at declaration */
+int
+gpujpeg_decoder_decode_batch(struct gpujpeg_decoder* decoder, int count, uint8_t* const* images,
+                             const size_t* image_sizes, size_t output_stride, struct gpujpeg_decoder_output* output,
+                             int* error_index)
+{
+    int ignored_error_index = -1;
+    if ( error_index == NULL ) {
+        error_index = &ignored_error_index;
+    }
+    *error_index = -1;
+    int rc = decoder_batch_check_args(decoder, count, images, image_sizes, output, error_index);
+    if ( rc != GPUJPEG_NOERR ) {
+        return rc;
+    }
+    struct gpujpeg_coder* coder = &decoder->coder;
+    struct gpujpeg_decoder_batch* batch = &decoder->batch;
+    batch->reason = GPUJPEG_BATCH_REASON_NONE;
+    if ( count > batch->metadata_capacity ) {
+        struct gpujpeg_image_metadata* metadata = realloc(batch->metadata, count * sizeof *metadata);
+        if ( metadata == NULL ) {
+            ERROR_MSG("Cannot allocate batch metadata!\n");
+            return GPUJPEG_ERROR;
+        }
+        batch->metadata = metadata;
+        batch->metadata_capacity = count;
+    }
+
+    coder->start_time = coder->param.perf_stats ? gpujpeg_get_time() : 0;
+
+    // tables of an earlier failed batch, reading may change them
+    if ( (batch->quant_dirty | batch->huffman_dirty) != 0 && decoder_flush_tables(decoder) != 0 ) {
+        return GPUJPEG_ERROR;
+    }
+
+    size_t image_size = 0; // raw bytes of an image
+    size_t stride = 0;     // of the output
+    size_t raw_stride = 0; // of the buffer the postprocessor writes
+    size_t data_size = 0;  // coefficients of all images, also the ones read by the IDCT beyond the last image
+    bool cpu_huffman = false;
+    batch->active = true;
+    batch->count = count;
+    batch->init_failed = false;
+    decoder->segment_count = 0;
+    decoder->data_compressed_size = 0;
+
+    // Read all images (layout of the batch built for the first one), no output written yet
+    GPUJPEG_CUSTOM_TIMER_START(coder->duration_stream, coder->param.perf_stats, coder->stream, rc = GPUJPEG_ERROR;
+                               goto fail);
+    for ( int i = 0; i < count; i++ ) {
+        batch->image = i;
+        rc = gpujpeg_reader_read_image(decoder, images[i], image_sizes[i]);
+        if ( rc != GPUJPEG_NOERR ) {
+            ERROR_MSG("Batch image %d could not be read!\n", i);
+            *error_index = batch->init_failed ? -1 : i;
+            goto fail;
+        }
+        if ( i == 0 ) {
+            image_size = coder->data_raw_size;
+            stride = output_stride != 0 ? output_stride : image_size;
+            if ( image_size == 0 || stride < image_size || (size_t)(count - 1) > (SIZE_MAX - image_size) / stride ) {
+                ERROR_MSG("Batch output stride %zu invalid for %d images of %zu bytes!\n", output_stride, count,
+                          image_size);
+                rc = GPUJPEG_ERROR;
+                goto fail;
+            }
+            if ( coder->param_image.pixel_format == GPUJPEG_422_U8_P1020 && coder->param_image.width % 2 != 0 ) {
+                ERROR_MSG("Odd-width %s output is not supported for batches!\n",
+                          gpujpeg_pixel_format_get_name(coder->param_image.pixel_format));
+                batch->reason = GPUJPEG_BATCH_REASON_DOMAIN;
+                rc = GPUJPEG_ERR_BATCH_UNSUPPORTED;
+                goto fail;
+            }
+        }
+    }
+    GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_stream, coder->param.perf_stats, coder->stream, rc = GPUJPEG_ERROR;
+                              goto fail);
+
+    // Huffman decoding route of gpujpeg_decoder_decode() for one image (equal for all), but without resynchronization
+    cpu_huffman = coder->segment_count < 32;
+    for ( int comp = 0; comp < coder->param.comp_count; comp++ ) {
+        const int dc = decoder->comp_table_huffman_map[comp][GPUJPEG_HUFFMAN_DC];
+        cpu_huffman = cpu_huffman || dc != decoder->comp_table_huffman_map[comp][GPUJPEG_HUFFMAN_AC] || dc > 1;
+    }
+    decoder->huffman_route = cpu_huffman ? GPUJPEG_HUFFMAN_ROUTE_CPU : GPUJPEG_HUFFMAN_ROUTE_GPU;
+    data_size = count * coder->image_data_stride; // the batch allocation holds that (gpujpeg_coder_init_image())
+    rc = GPUJPEG_ERROR;                           // for the failures below
+    if ( decoder_upload_tables(decoder) != 0 ) {
+        goto fail;
+    }
+    GPUJPEG_CUSTOM_TIMER_START(coder->duration_in_gpu, coder->param.perf_stats, coder->stream, goto fail);
+    GPUJPEG_CUSTOM_TIMER_START(coder->duration_huffman_coder, coder->param.perf_stats, coder->stream, goto fail);
+    if ( cpu_huffman ) {
+        if ( coder->data_quantized == NULL && gpujpeg_coder_allocate_cpu_huffman_buf(coder) != 0 ) {
+            goto fail;
+        }
+        // all uploaded coefficients defined (the decoder writes only the blocks, the IDCT reads beyond them)
+        memset(coder->data_quantized, 0, data_size * sizeof(int16_t));
+        for ( int i = 0; i < count; i++ ) {
+            if ( gpujpeg_huffman_cpu_decoder_decode(decoder, i * coder->segment_count, coder->segment_count,
+                                                    i * coder->image_data_stride) != 0 ) {
+                ERROR_MSG("Huffman decoder failed for batch image %d!\n", i);
+                *error_index = i;
+                goto fail;
+            }
+        }
+        if ( cudaMemcpyAsync(coder->d_data_quantized, coder->data_quantized, data_size * sizeof(int16_t),
+                             cudaMemcpyHostToDevice, coder->stream) != cudaSuccess ) {
+            goto fail;
+        }
+    }
+    else {
+        // segments are final now; the Huffman decoder reads ahead, so initialized bytes follow the data
+        memset(coder->data_compressed + decoder->data_compressed_size, 0, GPUJPEG_DECODER_COMPRESSED_TAIL);
+        if ( cudaMemsetAsync(coder->d_data_quantized, 0, data_size * sizeof(int16_t), coder->stream) != cudaSuccess ||
+             gpujpeg_cuda_memcpy_async_partially_pinned(coder->d_data_compressed, coder->data_compressed,
+                                                        decoder->data_compressed_size + GPUJPEG_DECODER_COMPRESSED_TAIL,
+                                                        cudaMemcpyHostToDevice, coder->stream,
+                                                        coder->data_compressed_pinned_sz) != cudaSuccess ||
+             cudaMemcpyAsync(coder->d_segment, coder->segment, decoder->segment_count * sizeof(struct gpujpeg_segment),
+                             cudaMemcpyHostToDevice, coder->stream) != cudaSuccess ||
+             gpujpeg_huffman_gpu_decoder_decode(decoder, true) != 0 ) {
+            goto fail;
+        }
+    }
+    GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_huffman_coder, coder->param.perf_stats, coder->stream, goto fail);
+
+    GPUJPEG_CUSTOM_TIMER_START(coder->duration_dct_quantization, coder->param.perf_stats, coder->stream, goto fail);
+    if ( gpujpeg_idct_gpu(decoder, count) != 0 ) {
+        goto fail;
+    }
+    GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_dct_quantization, coder->param.perf_stats, coder->stream, goto fail);
+
+    // Pixels directly to custom CUDA output, otherwise to the internal buffer (packed for a custom host output)
+    raw_stride = output->type == GPUJPEG_DECODER_OUTPUT_CUSTOM_BUFFER ? image_size : stride;
+    if ( output->type == GPUJPEG_DECODER_OUTPUT_CUSTOM_CUDA_BUFFER ) {
+        coder->d_data_raw = output->data;
+    }
+    else {
+        if ( decoder_ensure_raw(coder, (count - 1) * raw_stride + image_size) != 0 ) {
+            goto fail;
+        }
+        coder->d_data_raw = coder->d_data_raw_allocated;
+    }
+    GPUJPEG_CUSTOM_TIMER_START(coder->duration_preprocessor, coder->param.perf_stats, coder->stream, goto fail);
+    rc = gpujpeg_postprocessor_decode(coder, coder->stream, count, raw_stride);
+    if ( rc != GPUJPEG_NOERR ) {
+        goto fail;
+    }
+    rc = GPUJPEG_ERROR;
+    GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_preprocessor, coder->param.perf_stats, coder->stream, goto fail);
+
+    GPUJPEG_CUSTOM_TIMER_START(coder->duration_memory_from, coder->param.perf_stats, coder->stream, goto fail);
+    if ( output->type == GPUJPEG_DECODER_OUTPUT_INTERNAL_BUFFER ) {
+        if ( cudaMemcpyAsync(coder->data_raw, coder->d_data_raw, (count - 1) * raw_stride + image_size,
+                             cudaMemcpyDeviceToHost, coder->stream) != cudaSuccess ) {
+            goto fail;
+        }
+    }
+    else if ( output->type == GPUJPEG_DECODER_OUTPUT_CUSTOM_BUFFER ) {
+        // without the padding of the last line, as gpujpeg_decoder_decode()
+        if ( cudaMemcpy2DAsync(output->data, stride, coder->d_data_raw, image_size,
+                               image_size - coder->param_image.width_padding, count, cudaMemcpyDeviceToHost,
+                               coder->stream) != cudaSuccess ) {
+            goto fail;
+        }
+    }
+    GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_memory_from, coder->param.perf_stats, coder->stream, goto fail);
+    GPUJPEG_CUSTOM_TIMER_STOP(coder->duration_in_gpu, coder->param.perf_stats, coder->stream, goto fail);
+
+    // the only synchronization of the GPU route for CUDA outputs, all images are ready afterwards
+    if ( cudaStreamSynchronize(coder->stream) != cudaSuccess ) {
+        ERROR_MSG("Batch decoding failed: %s!\n", cudaGetErrorString(cudaGetLastError()));
+        goto fail;
+    }
+    batch->quant_dirty = 0; // uploaded and completed
+    batch->huffman_dirty = 0;
+    batch->active = false;
+
+    if ( output->type == GPUJPEG_DECODER_OUTPUT_INTERNAL_BUFFER ) {
+        output->data = coder->data_raw;
+    }
+    else if ( output->type == GPUJPEG_DECODER_OUTPUT_CUDA_BUFFER ) {
+        output->data = coder->d_data_raw;
+    }
+    output->data_size = image_size;
+    output->param_image = coder->param_image;
+    if ( output->param_image.color_space == GPUJPEG_NONE ) {
+        output->param_image.color_space = coder->param.color_space_internal;
+    }
+    output->metadata = batch->metadata;
+    coder_process_stats(coder);
+    return GPUJPEG_NOERR;
+
+fail:
+    // device tables consistent with the host ones, queued work completed
+    if ( decoder_flush_tables(decoder) != 0 ) {
+        *error_index = -1;
+        rc = GPUJPEG_ERROR;
+    }
+    batch->active = false;
+    return rc;
+}
+
 int
 gpujpeg_decoder_get_stats(struct gpujpeg_decoder *decoder, struct gpujpeg_duration_stats *stats)
 {
@@ -627,6 +983,7 @@ gpujpeg_decoder_destroy(struct gpujpeg_decoder* decoder)
         gpujpeg_huffman_gpu_decoder_destroy(decoder->huffman_gpu_decoder, &decoder->coder);
     }
 
+    free(decoder->batch.metadata);
     free(decoder);
 
     return 0;

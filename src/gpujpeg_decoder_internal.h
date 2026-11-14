@@ -60,6 +60,53 @@ struct gpujpeg_huffman_gpu_resync_param
     size_t min_bytes;  ///< smaller scans use CPU unless the documented default exception applies
 };
 
+/// bytes after the compressed data of a batch kept free by the reader and initialized for the GPU Huffman decoder
+/// (it loads two 16-byte chunks at the aligned segment start)
+#define GPUJPEG_DECODER_COMPRESSED_TAIL 32
+
+/// maximal output alignment (GPUJPEG_DEC_OPT_ALIGNMENT_BYTES_INT) of batches; it bounds the line padding
+#define GPUJPEG_DECODER_BATCH_MAX_ALIGNMENT (1 << 20)
+
+/// Batch check that rejected the last batch image (unit-test diagnostics)
+enum gpujpeg_batch_reason {
+    GPUJPEG_BATCH_REASON_NONE,
+    GPUJPEG_BATCH_REASON_LAYOUT,      ///< dimensions, sampling, restart interval, interleaving, color or pixel format
+    GPUJPEG_BATCH_REASON_COMPONENTS,  ///< component IDs or table selectors
+    GPUJPEG_BATCH_REASON_TABLES,      ///< used tables or their contents
+    GPUJPEG_BATCH_REASON_TABLE_SCOPE, ///< table not defined by the image before use or changed after its use
+    GPUJPEG_BATCH_REASON_SCANS,       ///< frame and scan structure (SOF count, scan order, scan parameters)
+    GPUJPEG_BATCH_REASON_SEGMENTS,    ///< restart segment count or restart marker order of a scan
+    GPUJPEG_BATCH_REASON_DOMAIN,      ///< sampling or output format not supported in a batch
+};
+
+/// State of gpujpeg_decoder_decode_batch() (images, tables and metadata)
+struct gpujpeg_decoder_batch
+{
+    bool active;      ///< the reader applies the batch rules (any image count, also 1)
+    int count;        ///< images of the call
+    int image;        ///< index of the image being read
+    bool init_failed; ///< the batch as a whole cannot be decoded (layout allocation, CUDA, batch limits, output format)
+    enum gpujpeg_batch_reason reason;
+
+    /// table slots committed on host by batch reading but not yet uploaded and completed (also after a failure):
+    /// bit index for quantization tables, bit index * 2 + class for Huffman tables
+    unsigned quant_dirty;
+    unsigned huffman_dirty;
+
+    /// used by the first image (compared with the other ones)
+    uint8_t comp_id[GPUJPEG_MAX_COMPONENT_COUNT];
+    int quant_map[GPUJPEG_MAX_COMPONENT_COUNT];
+    int huffman_map[GPUJPEG_MAX_COMPONENT_COUNT][GPUJPEG_HUFFMAN_TYPE_COUNT];
+    unsigned quant_used;
+    unsigned huffman_used;
+    uint8_t quant[GPUJPEG_MAX_COMPONENT_COUNT][64];
+    uint8_t huffman_bits[GPUJPEG_MAX_COMPONENT_COUNT][GPUJPEG_HUFFMAN_TYPE_COUNT][17];
+    uint8_t huffman_val[GPUJPEG_MAX_COMPONENT_COUNT][GPUJPEG_HUFFMAN_TYPE_COUNT][256];
+
+    struct gpujpeg_image_metadata* metadata; ///< per image
+    int metadata_capacity;
+};
+
 /**
  * JPEG decoder structure
  */
@@ -103,7 +150,25 @@ struct gpujpeg_decoder
 
     /// metadata associated with last decoded image
     struct gpujpeg_image_metadata metadata;
+
+    struct gpujpeg_decoder_batch batch;
 };
+
+/**
+ * @retval true if the coder layout of param and param_image differs from the decoder's (needs reinitialization)
+ */
+bool
+gpujpeg_decoder_layout_differs(const struct gpujpeg_coder* coder, const struct gpujpeg_parameters* param,
+                               const struct gpujpeg_image_parameters* param_image);
+
+/**
+ * gpujpeg_decoder_init() for image_count images, with batch limits (gpujpeg_coder_init_image())
+ *
+ * @return 0 if succeeds, otherwise nonzero
+ */
+int
+gpujpeg_decoder_init_layout(struct gpujpeg_decoder* decoder, const struct gpujpeg_parameters* param,
+                            const struct gpujpeg_image_parameters* param_image, int image_count, bool batch);
 
 #endif // GPUJPEG_DECODER_INTERNAL_H
 

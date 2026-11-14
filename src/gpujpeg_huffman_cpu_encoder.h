@@ -34,14 +34,13 @@
 #include "gpujpeg_encoder_internal.h"
 
 /**
- * Perform huffman encoding
- * 
- * @param encoder  Encoder structure
- * @param type  Component type
- * @param data  Data buffer
+ * Perform huffman encoding of an image (scans with headers to the writer)
+ *
+ * @param encoder       Encoder structure
+ * @param image_offset  coefficient elements of the image from the beginning of coder.data_quantized
  * @return 0 if succeeds, otherwise nonzero
  */
 int
-gpujpeg_huffman_cpu_encoder_encode(struct gpujpeg_encoder* encoder);
+gpujpeg_huffman_cpu_encoder_encode(struct gpujpeg_encoder* encoder, size_t image_offset);
 
 #endif // GPUJPEG_HUFFMAN_CPU_ENCODER_H

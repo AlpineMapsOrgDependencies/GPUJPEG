@@ -77,13 +77,14 @@ void
 gpujpeg_huffman_gpu_decoder_destroy(struct gpujpeg_huffman_gpu_decoder *, const struct gpujpeg_coder* coder);
 
 /**
- * Perform huffman decoding
- * 
- * @param encoder  Decoder structure
+ * Perform huffman decoding of decoder->segment_count segments
+ *
+ * @param encoder     Decoder structure
+ * @param block_list  decode by the block lists also a single component (always for a batch of images)
  * @return 0 if succeeds, otherwise nonzero
  */
 int
-gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder);
+gpujpeg_huffman_gpu_decoder_decode(struct gpujpeg_decoder* decoder, bool block_list);
 
 /**
  * Checks if the image (parsed, before the copy to device) can be Huffman decoded on GPU without restart markers:

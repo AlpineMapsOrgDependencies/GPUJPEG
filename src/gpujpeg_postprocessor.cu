@@ -203,7 +203,8 @@ struct post_load<in_is_rgb, GPUJPEG_DYNAMIC>
  * @return void
  */
 typedef void (*gpujpeg_preprocessor_decode_kernel)(struct gpujpeg_preprocessor_data data, uint8_t* d_data_raw,
-                                                   int width_padding, int image_width, int image_height);
+                                                   int width_padding, int image_width, int image_height,
+                                                   size_t comp_stride, size_t raw_stride);
 
 template<
     enum gpujpeg_color_space color_space_internal,
@@ -216,8 +217,19 @@ template<
 >
 __global__ void
 gpujpeg_preprocessor_comp_to_raw_kernel(struct gpujpeg_preprocessor_data data, uint8_t* d_data_raw,
-                                        int image_width_padding, int image_width, int image_height)
+                                        int image_width_padding, int image_width, int image_height, size_t comp_stride,
+                                        size_t raw_stride)
 {
+    // image of a batch (grid z): component data and raw data comp_stride and raw_stride elements apart
+    if ( blockIdx.z != 0 ) {
+        for ( int comp = 0; comp < GPUJPEG_MAX_COMPONENT_COUNT; comp++ ) {
+            if ( data.comp[comp].d_data != nullptr ) {
+                data.comp[comp].d_data += blockIdx.z * comp_stride;
+            }
+        }
+        d_data_raw += blockIdx.z * raw_stride;
+    }
+
     int x  = threadIdx.x;
     int gX = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x;
     int image_position = gX + x;
@@ -445,29 +457,38 @@ gpujpeg_postprocessor_decoder_init(struct gpujpeg_coder* coder)
  * @invariant gpujpeg_preprocessor_decode_no_transform(coder) != 0
  */
 static int
-gpujpeg_preprocessor_decoder_copy_planar_data(struct gpujpeg_coder * coder, cudaStream_t stream)
+gpujpeg_preprocessor_decoder_copy_planar_data(struct gpujpeg_coder* coder, cudaStream_t stream, int image_count,
+                                              size_t raw_stride)
 {
     assert(coder->param.comp_count == 1 || coder->param.comp_count == 3);
-    size_t data_raw_offset = 0;
     bool needs_stride = false; // true if width is not divisible by MCU width
     for ( int i = 0; i < coder->param.comp_count; ++i ) {
         int component_width = coder->component[i].width + coder->param_image.width_padding;
         needs_stride = needs_stride || component_width != coder->component[i].data_width;
     }
-    if (!needs_stride) {
+    for ( int image = 0; image < image_count; ++image ) {
+        uint8_t* const d_data_raw = coder->d_data_raw + image * raw_stride;
+        const size_t comp_offset = image * coder->image_data_stride;
+        size_t data_raw_offset = 0;
+        if ( !needs_stride ) {
             for ( int i = 0; i < coder->param.comp_count; ++i ) {
-                    size_t component_size = coder->component[i].width * coder->component[i].height;
-                    cudaMemcpyAsync(coder->d_data_raw + data_raw_offset, coder->component[i].d_data, component_size, cudaMemcpyDeviceToDevice, stream);
-                    data_raw_offset += component_size;
+                size_t component_size = coder->component[i].width * coder->component[i].height;
+                cudaMemcpyAsync(d_data_raw + data_raw_offset, coder->component[i].d_data + comp_offset, component_size,
+                                cudaMemcpyDeviceToDevice, stream);
+                data_raw_offset += component_size;
             }
-    } else {
+        }
+        else {
             for ( int i = 0; i < coder->param.comp_count; ++i ) {
-                    int spitch = coder->component[i].data_width;
-                    int dpitch = coder->component[i].width + coder->param_image.width_padding;
-                    size_t component_size = dpitch * coder->component[i].height;
-                    cudaMemcpy2DAsync(coder->d_data_raw + data_raw_offset, dpitch, coder->component[i].d_data, spitch, coder->component[i].width, coder->component[i].height, cudaMemcpyDeviceToDevice, stream);
-                    data_raw_offset += component_size;
+                int spitch = coder->component[i].data_width;
+                int dpitch = coder->component[i].width + coder->param_image.width_padding;
+                size_t component_size = dpitch * coder->component[i].height;
+                cudaMemcpy2DAsync(d_data_raw + data_raw_offset, dpitch, coder->component[i].d_data + comp_offset,
+                                  spitch, coder->component[i].width, coder->component[i].height,
+                                  cudaMemcpyDeviceToDevice, stream);
+                data_raw_offset += component_size;
             }
+        }
     }
     gpujpeg_cuda_check_error("Preprocessor copy failed", return -1);
     return 0;
@@ -483,13 +504,15 @@ gpujpeg_preprocessor_decoder_copy_planar_data(struct gpujpeg_coder * coder, cuda
 
 /* Documented at declaration */
 int
-gpujpeg_postprocessor_decode(struct gpujpeg_coder* coder, cudaStream_t stream)
+gpujpeg_postprocessor_decode(struct gpujpeg_coder* coder, cudaStream_t stream, int image_count, size_t raw_stride)
 {
+    // flipping and channel remapping only for a single image (rejected for batches)
+    assert(image_count == 1 || (!coder->preprocessor.flipped && coder->preprocessor.channel_remap == 0));
     PERFORM_IF_ENABLED_CHECK(coder->preprocessor.flipped, gpujpeg_preprocessor_flip_lines(coder));
 
     if ( coder->preprocessor.kernel == nullptr ) {
         PERFORM_IF_ENABLED_CHECK(coder->preprocessor.channel_remap != 0, gpujpeg_preprocessor_channel_remap(coder));
-        return gpujpeg_preprocessor_decoder_copy_planar_data(coder, stream);
+        return gpujpeg_preprocessor_decoder_copy_planar_data(coder, stream, image_count, raw_stride);
     }
 
     // Select kernel
@@ -520,16 +543,12 @@ gpujpeg_postprocessor_decode(struct gpujpeg_coder* coder, cudaStream_t stream)
         grid.y = gpujpeg_div_and_round_up(grid.x, GPUJPEG_CUDA_MAXIMUM_GRID_SIZE);
         grid.x = GPUJPEG_CUDA_MAXIMUM_GRID_SIZE;
     }
+    grid.z = image_count;
 
     // Run kernel
     coder->preprocessor.data.chroma_filter = coder->preprocessor.chroma_filter;
-    kernel<<<grid, threads, 0, stream>>>(
-        coder->preprocessor.data,
-        coder->d_data_raw,
-        coder->param_image.width_padding,
-        image_width,
-        image_height
-    );
+    kernel<<<grid, threads, 0, stream>>>(coder->preprocessor.data, coder->d_data_raw, coder->param_image.width_padding,
+                                         image_width, image_height, coder->image_data_stride, raw_stride);
     gpujpeg_cuda_check_error("Preprocessor encoding failed", return -1);
 
     PERFORM_IF_ENABLED_CHECK(coder->preprocessor.channel_remap != 0, gpujpeg_preprocessor_channel_remap(coder));

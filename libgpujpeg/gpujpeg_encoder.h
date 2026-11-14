@@ -185,6 +185,46 @@ gpujpeg_encoder_encode(struct gpujpeg_encoder* encoder, const struct gpujpeg_par
                        uint8_t** image_compressed, size_t* image_compressed_size);
 
 /**
+ * Compress a batch of images with one configuration (each GPU stage runs once for all of them)
+ *
+ * Image i is read from input->image + i * stride, where stride is input_stride or the image size
+ * (gpujpeg_image_calculate_size()) if input_stride is 0; host images are copied once to the GPU, GPU images are read
+ * in place. Each JPEG equals the one gpujpeg_encoder_encode() of that image would produce with the same parameters
+ * and options, except that all images share the Exif DateTime of the first one. Images without restart markers are
+ * entropy-coded on the CPU (one after another). Not supported are the encoder options for flipping and channel
+ * remapping, OpenGL input, planar pixel formats with width_padding, @ref GPUJPEG_422_U8_P1020 with odd width or with
+ * width_padding not divisible by 4, odd-width @ref GPUJPEG_422_U8_P0P1P2 that is converted (other color space than
+ * the internal one or other sampling than the JPEG), grayscale JPEGs (comp_count 1) interleaved with other sampling
+ * than 1x1 and input color spaces without a compiled-in conversion (@ref GPUJPEG_YUV without ENABLE_YUV). Exif
+ * metadata must fit its APP1 marker and segment info its headers.
+ *
+ * The effective stride must be at least the image size. Input storage must cover
+ * (count - 1) * stride + image_size bytes. Returns when all images are compressed.
+ * The input pixels and result arrays must not overlap one another, the input or parameter descriptors, or
+ * encoder-owned buffers. In particular, the two result arrays must be disjoint.
+ *
+ * @param encoder      encoder structure (not used by another call meanwhile)
+ * @param param        parameters for coder, as for gpujpeg_encoder_encode()
+ * @param param_image  parameters of each image
+ * @param count        number of images, 1 to @ref GPUJPEG_BATCH_MAX_COUNT (sizes and memory may limit it more)
+ * @param input        @ref GPUJPEG_ENCODER_INPUT_IMAGE (host) or @ref GPUJPEG_ENCODER_INPUT_GPU_IMAGE (device) input
+ * @param input_stride bytes from an input image to the next one, 0 for the image size
+ * @param[out] images_compressed  count pointers to the JPEG images, which are stored one after another in a host
+ *                     buffer owned by the encoder (valid until the next encoding attempt, successful or failed,
+ *                     or destruction of the encoder);
+ *                     not changed on failure
+ * @param[out] image_compressed_sizes  count JPEG sizes, not changed on failure
+ * @retval GPUJPEG_NOERR                 success
+ * @retval GPUJPEG_ERR_BATCH_UNSUPPORTED the input, an encoder option or the pixel format is not supported in a batch
+ * @retval other                         @ref Errors, eg. invalid arguments or metadata, memory allocation or CUDA
+ */
+GPUJPEG_API int
+gpujpeg_encoder_encode_batch(struct gpujpeg_encoder* encoder, const struct gpujpeg_parameters* param,
+                             const struct gpujpeg_image_parameters* param_image, int count,
+                             const struct gpujpeg_encoder_input* input, size_t input_stride,
+                             uint8_t** images_compressed, size_t* image_compressed_sizes);
+
+/**
  * Returns duration statistics for last encoded image
  * @return 0 if succeeds, otherwise nonzero
  * @note

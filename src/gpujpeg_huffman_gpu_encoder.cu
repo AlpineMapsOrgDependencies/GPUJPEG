@@ -1007,7 +1007,9 @@ gpujpeg_huffman_gpu_encoder_grid_size(int tblock_count)
 
 /* Documented at declaration */
 int
-gpujpeg_huffman_gpu_encoder_encode(struct gpujpeg_encoder* encoder, struct gpujpeg_huffman_gpu_encoder * huffman_gpu_encoder, unsigned int * output_byte_count)
+gpujpeg_huffman_gpu_encoder_encode(struct gpujpeg_encoder* encoder,
+                                   struct gpujpeg_huffman_gpu_encoder* huffman_gpu_encoder, int segment_count,
+                                   bool block_list, unsigned int* output_byte_count)
 {
     // Get coder
     struct gpujpeg_coder* coder = &encoder->coder;
@@ -1024,77 +1026,52 @@ gpujpeg_huffman_gpu_encoder_encode(struct gpujpeg_encoder* encoder, struct gpujp
     if ( encoder->coder.cuda_cc_major < 2 ) {
         // Run kernel
         dim3 thread(THREAD_BLOCK_SIZE);
-        dim3 grid(gpujpeg_div_and_round_up(coder->segment_count, thread.x));
+        dim3 grid(gpujpeg_div_and_round_up(segment_count, thread.x));
         gpujpeg_huffman_encoder_encode_kernel<<<grid, thread, 0, coder->stream>>>(
-            coder->d_component,
-            coder->d_segment,
-            comp_count,
-            coder->segment_count,
-            coder->d_temp_huffman,
-            huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count
-        );
+            coder->d_component, coder->d_segment, comp_count, segment_count, coder->d_temp_huffman,
+            huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count);
         gpujpeg_cuda_check_error("Huffman encoding failed", return -1);
     } else {
         // Run encoder kernel
         dim3 thread(32 * WARPS_NUM);
-        dim3 grid = gpujpeg_huffman_gpu_encoder_grid_size(gpujpeg_div_and_round_up(coder->segment_count, (thread.x / 32)));
-        if(comp_count == 1) {
+        dim3 grid = gpujpeg_huffman_gpu_encoder_grid_size(gpujpeg_div_and_round_up(segment_count, (thread.x / 32)));
+        if ( comp_count == 1 && !block_list ) {
             gpujpeg_huffman_encoder_encode_kernel_warp<true><<<grid, thread, 0, coder->stream>>>(
-                coder->d_segment,
-                coder->segment_count,
-                coder->d_data_compressed,
-                coder->d_block_list,
-                coder->d_data_quantized,
-                coder->d_component,
-                comp_count,
-                huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count,
-                huffman_gpu_encoder->d_lut
-            );
+                coder->d_segment, segment_count, coder->d_data_compressed, coder->d_block_list, coder->d_data_quantized,
+                coder->d_component, comp_count, huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count,
+                huffman_gpu_encoder->d_lut);
             gpujpeg_cuda_check_error("Huffman encoding failed", return -1);
-        } else {
+        }
+        else {
             gpujpeg_huffman_encoder_encode_kernel_warp<false><<<grid, thread, 0, coder->stream>>>(
-                coder->d_segment,
-                coder->segment_count,
-                coder->d_data_compressed,
-                coder->d_block_list,
-                coder->d_data_quantized,
-                coder->d_component,
-                comp_count,
-                huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count,
-                huffman_gpu_encoder->d_lut
-            );
+                coder->d_segment, segment_count, coder->d_data_compressed, coder->d_block_list, coder->d_data_quantized,
+                coder->d_component, comp_count, huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count,
+                huffman_gpu_encoder->d_lut);
             gpujpeg_cuda_check_error("Huffman encoding failed", return -1);
         }
 
         // Run codeword serialization kernel
-        const int num_serialization_tblocks = gpujpeg_div_and_round_up(coder->segment_count, SERIALIZATION_THREADS_PER_TBLOCK);
+        const int num_serialization_tblocks = gpujpeg_div_and_round_up(segment_count, SERIALIZATION_THREADS_PER_TBLOCK);
         gpujpeg_huffman_encoder_serialization_kernel<<<num_serialization_tblocks, SERIALIZATION_THREADS_PER_TBLOCK, 0,
                                                        coder->stream>>>(
-            coder->d_segment,
-            coder->segment_count,
-            coder->d_data_compressed,
-            coder->d_temp_huffman
-        );
+            coder->d_segment, segment_count, coder->d_data_compressed, coder->d_temp_huffman);
         gpujpeg_cuda_check_error("Codeword serialization failed", return -1);
     }
 
     // No atomic operations in CC 1.0 => run output size computation kernel to allocate the output buffer space
     if ( encoder->coder.cuda_cc_major == 1 && encoder->coder.cuda_cc_minor == 0 ) {
         gpujpeg_huffman_encoder_allocation_kernel<<<1, 512, 0, coder->stream>>>(
-            coder->d_segment, coder->segment_count, huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count);
+            coder->d_segment, segment_count, huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count);
         gpujpeg_cuda_check_error("Huffman encoder output allocation failed", return -1);
     }
 
     // Run output compaction kernel (one warp per segment)
     const dim3 compaction_thread(32, WARPS_NUM);
-    const dim3 compaction_grid = gpujpeg_huffman_gpu_encoder_grid_size(gpujpeg_div_and_round_up(coder->segment_count, WARPS_NUM));
+    const dim3 compaction_grid =
+        gpujpeg_huffman_gpu_encoder_grid_size(gpujpeg_div_and_round_up(segment_count, WARPS_NUM));
     gpujpeg_huffman_encoder_compaction_kernel<<<compaction_grid, compaction_thread, 0, coder->stream>>>(
-        coder->d_segment,
-        coder->segment_count,
-        coder->d_temp_huffman,
-        coder->d_data_compressed,
-        huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count
-    );
+        coder->d_segment, segment_count, coder->d_temp_huffman, coder->d_data_compressed,
+        huffman_gpu_encoder->d_gpujpeg_huffman_output_byte_count);
     gpujpeg_cuda_check_error("Huffman output compaction failed", return -1);
 
     // Read and return number of occupied bytes

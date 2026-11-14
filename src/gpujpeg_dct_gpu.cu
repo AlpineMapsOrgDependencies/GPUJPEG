@@ -175,13 +175,18 @@ __constant__ float gpujpeg_dct_gpu_quantization_table_const[64];
  * @param output        [OUT] - Source coefficients
  * @param output_stride [OUT] - Stride of source
  * @param quant_table   [IN]  - Quantization table, pre-divided with DCT output scales
+ * @param image_stride  [IN]  - Elements of source and output from an image to the next one (grid z)
  * @return None
  */
 template <int WARP_COUNT>
 __global__ void
 gpujpeg_dct_gpu_kernel(int block_count_x, int block_count_y, uint8_t* source, const unsigned int source_stride,
-                       int16_t* output, int output_stride, const float * const quant_table)
+                       int16_t* output, int output_stride, const float* const quant_table, size_t image_stride)
 {
+    // image of a batch (grid z): source and output image_stride elements apart
+    source += blockIdx.z * image_stride;
+    output += blockIdx.z * image_stride;
+
     // each warp processes 4 8x8 blocks (horizontally neighboring)
     const int block_idx_x = threadIdx.x >> 3;
     const int block_idx_y = threadIdx.y;
@@ -463,15 +468,19 @@ gpujpeg_idct_gpu_kernel_inplace(float* V8)
  * @param output             [OUT] - Result coefficients
  * @param output_stride      [OUT] - Stride of result (image width)
  * @param quantization_table [IN]  - Quantization table
+ * @param image_stride       [IN]  - Elements of source and result from an image to the next one (grid y)
  * @return None
  */
 __global__ void
-gpujpeg_idct_gpu_kernel(int16_t* source, uint8_t* result, int output_stride, uint16_t* quantization_table)
+gpujpeg_idct_gpu_kernel(int16_t* source, uint8_t* result, int output_stride, uint16_t* quantization_table,
+                        size_t image_stride)
 {
-	//here the grid is assumed to be only in x - it saves a few operations; if a larger
-	//block count is used (e. g. GPUJPEG_IDCT_BLOCK_Z == 1), it would need to be adjusted,
-	//the blockIdx.x not to exceed 65535. In the current state this function is good 
-	//enough for a 67.1 MPix picture (8K is 33.1 MPix)
+    // here the blocks of an image are assumed to be only in x (grid y is the image index) - it saves a few
+    // operations; if a larger block count is used (e. g. GPUJPEG_IDCT_BLOCK_Z == 1), it would need to be adjusted,
+    // the blockIdx.x not to exceed 65535. In the current state this function is good
+    // enough for a 67.1 MPix picture (8K is 33.1 MPix)
+    source += blockIdx.y * image_stride;
+    result += blockIdx.y * image_stride;
 
 	//the first block of picture processed in this thread block
 	unsigned int picBlockNumber = (blockIdx.x) * GPUJPEG_IDCT_BLOCK_Y * GPUJPEG_IDCT_BLOCK_X
@@ -615,7 +624,7 @@ gpujpeg_idct_gpu_kernel(int16_t* source, uint8_t* result, int output_stride, uin
 
 /* Documented at declaration */
 int
-gpujpeg_dct_gpu(struct gpujpeg_encoder* encoder)
+gpujpeg_dct_gpu(struct gpujpeg_encoder* encoder, int image_count)
 {
     // Get coder
     struct gpujpeg_coder* coder = &encoder->coder;
@@ -652,21 +661,12 @@ gpujpeg_dct_gpu(struct gpujpeg_encoder* encoder)
         enum { WARP_COUNT = 4 };
 
         // Perform block-wise DCT processing
-        dim3 dct_grid(
-            gpujpeg_div_and_round_up(block_count_x, 4),
-            gpujpeg_div_and_round_up(block_count_y, WARP_COUNT),
-            1
-        );
+        dim3 dct_grid(gpujpeg_div_and_round_up(block_count_x, 4), gpujpeg_div_and_round_up(block_count_y, WARP_COUNT),
+                      image_count);
         dim3 dct_block(4 * 8, WARP_COUNT);
         gpujpeg_dct_gpu_kernel<WARP_COUNT><<<dct_grid, dct_block, 0, coder->stream>>>(
-            block_count_x,
-            block_count_y,
-            component->d_data,
-            component->data_width,
-            component->d_data_quantized,
-            component->data_width * GPUJPEG_BLOCK_SIZE,
-            d_quantization_table
-        );
+            block_count_x, block_count_y, component->d_data, component->data_width, component->d_data_quantized,
+            component->data_width * GPUJPEG_BLOCK_SIZE, d_quantization_table, coder->image_data_stride);
         gpujpeg_cuda_check_error("Quantization table memcpy failed", return -1);
     }
 
@@ -675,7 +675,7 @@ gpujpeg_dct_gpu(struct gpujpeg_encoder* encoder)
 
 /* Documented at declaration */
 int
-gpujpeg_idct_gpu(struct gpujpeg_decoder* decoder)
+gpujpeg_idct_gpu(struct gpujpeg_decoder* decoder, int image_count)
 {
     // Get coder
     struct gpujpeg_coder* coder = &decoder->coder;
@@ -697,15 +697,14 @@ gpujpeg_idct_gpu(struct gpujpeg_decoder* decoder)
 
 
         dim3 dct_grid(gpujpeg_div_and_round_up(block_count_x * block_count_y,
-				(GPUJPEG_IDCT_BLOCK_X * GPUJPEG_IDCT_BLOCK_Y * GPUJPEG_IDCT_BLOCK_Z) / GPUJPEG_BLOCK_SIZE), 1);
+                                               (GPUJPEG_IDCT_BLOCK_X * GPUJPEG_IDCT_BLOCK_Y * GPUJPEG_IDCT_BLOCK_Z) /
+                                                   GPUJPEG_BLOCK_SIZE),
+                      image_count);
         dim3 dct_block(GPUJPEG_IDCT_BLOCK_X, GPUJPEG_IDCT_BLOCK_Y, GPUJPEG_IDCT_BLOCK_Z);
- 
+
         gpujpeg_idct_gpu_kernel<<<dct_grid, dct_block, 0, coder->stream>>>(
-            component->d_data_quantized,
-            component->d_data,
-            component->data_width,
-            d_quantization_table
-        );
+            component->d_data_quantized, component->d_data, component->data_width, d_quantization_table,
+            coder->image_data_stride);
         gpujpeg_cuda_check_error("Inverse Integer DCT failed", return -1);
     }
 

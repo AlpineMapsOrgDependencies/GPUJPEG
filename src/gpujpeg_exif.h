@@ -31,6 +31,7 @@
 #define GPUJPEG_EXIF_H_6755D546_2A90_46DF_9ECA_22F575C3E7E3
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 struct gpujpeg_exif_tags;
@@ -44,6 +45,15 @@ gpujpeg_writer_write_exif(struct gpujpeg_writer* writer, const struct gpujpeg_pa
                           const struct gpujpeg_image_parameters* param_image,
                           const struct gpujpeg_image_metadata* metadata,
                           const struct gpujpeg_exif_tags* custom_tags);
+
+/**
+ * Upper bound of the APP1 marker length field value (including the field) that gpujpeg_writer_write_exif() writes
+ * with the custom tags (NULL for none)
+ *
+ * @return the bound (above 65535 if not representable), 0 if a custom tag has an unsupported type or count
+ */
+size_t
+gpujpeg_exif_app1_length_bound(const struct gpujpeg_exif_tags* custom_tags);
 
 bool
 gpujpeg_exif_add_tag(struct gpujpeg_exif_tags** exif_tags, const char *cfg);

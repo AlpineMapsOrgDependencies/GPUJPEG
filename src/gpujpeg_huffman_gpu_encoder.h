@@ -63,11 +63,15 @@ gpujpeg_huffman_gpu_encoder_destroy(struct gpujpeg_huffman_gpu_encoder * huffman
  *
  * @param encoder              Encoder structure
  * @param encoder_gpu_encoder
+ * @param segment_count        segments to encode (of all images of a batch)
+ * @param block_list           encode by the block lists also a single component (always for a batch of images)
  * @param output_byte_count    pointer to place in main system memory, where size of output buffer part, which contains all output data, should be saved
  * @return 0 if succeeds, otherwise nonzero
  */
 int
-gpujpeg_huffman_gpu_encoder_encode(struct gpujpeg_encoder* encoder, struct gpujpeg_huffman_gpu_encoder * huffman_gpu_encoder, unsigned int * output_byte_count);
+gpujpeg_huffman_gpu_encoder_encode(struct gpujpeg_encoder* encoder,
+                                   struct gpujpeg_huffman_gpu_encoder* huffman_gpu_encoder, int segment_count,
+                                   bool block_list, unsigned int* output_byte_count);
 
 #ifdef __cplusplus
 }

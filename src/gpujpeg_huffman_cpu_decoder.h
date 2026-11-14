@@ -35,10 +35,14 @@
 
 /**
  * Perform huffman decoding
- * 
+ *
+ * @param segment_begin  first segment to decode
+ * @param segment_count  segments to decode (of one image)
+ * @param image_offset   coefficient elements of the image from the beginning of coder.data_quantized
  * @return 0 if succeeds, otherwise nonzero
  */
 int
-gpujpeg_huffman_cpu_decoder_decode(struct gpujpeg_decoder* decoder);
+gpujpeg_huffman_cpu_decoder_decode(struct gpujpeg_decoder* decoder, int segment_begin, int segment_count,
+                                   size_t image_offset);
 
 #endif // GPUJPEG_HUFFMAN_CPU_DECODER_H

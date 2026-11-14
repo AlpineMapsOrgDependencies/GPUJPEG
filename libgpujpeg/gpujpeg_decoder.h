@@ -213,6 +213,54 @@ GPUJPEG_API int
 gpujpeg_decoder_decode(struct gpujpeg_decoder* decoder, uint8_t* image, size_t image_size, struct gpujpeg_decoder_output* output);
 
 /**
+ * Decompress a batch of JPEG images with equal coding settings (each GPU stage runs once for all of them)
+ *
+ * Every image must be a sequential 8-bit JPEG (SOF0 or SOF1) with 1, 3 or 4 components, sampling factors 1 to 4
+ * dividing the maximal ones and either one interleaved scan or one scan per component, all in frame (SOF) component
+ * order. Each image must define the quantization and Huffman tables it uses before their use and must not change
+ * them afterwards. The dimensions, components (IDs, sampling, table selectors), used table contents, restart interval,
+ * scan structure and the resulting color space and pixel format must equal the first image. APPn and COM content
+ * (e.g. Exif with orientation) may differ; the orientation is reported in output metadata, not applied. Restart
+ * markers must be complete and in sequence. The decoder options for flipping and channel remapping, OpenGL output,
+ * odd-width @ref GPUJPEG_422_U8_P1020 output and output alignments above 2^20 bytes are not supported. Images without
+ * restart markers are decoded by the CPU Huffman decoder (unlike gpujpeg_decoder_decode(), which may use GPU
+ * resynchronization for them). Corrupted entropy-coded data is not necessarily detected (the GPU Huffman decoder does
+ * not report it); the pixels of such an image are then unspecified.
+ *
+ * The images, the images and image_sizes arrays, the output structure and its buffer must not overlap each other or
+ * buffers owned by the decoder (eg. a previous internal output, which a call may reallocate).
+ *
+ * Returns when all images are decoded. Image i is stored at output->data + i * stride, where stride is
+ * output_stride or the image size if output_stride is 0 (stride must not be smaller than the image size). Planar
+ * images are stored one after another (not as one planar image). Bytes between images are unspecified.
+ * A @ref GPUJPEG_DECODER_OUTPUT_CUSTOM_CUDA_BUFFER must hold (count - 1) * stride + image size bytes,
+ * a @ref GPUJPEG_DECODER_OUTPUT_CUSTOM_BUFFER (count - 1) * stride + image size - param_image.width_padding bytes
+ * (the last line padding is not written, as with gpujpeg_decoder_decode()).
+ *
+ * @param decoder      decoder structure (not used by another call meanwhile)
+ * @param count        number of images, 1 to @ref GPUJPEG_BATCH_MAX_COUNT (sizes and memory may limit it more)
+ * @param images       count pointers to the complete JPEG images in host memory (at least 4 bytes each)
+ * @param image_sizes  count image sizes in bytes
+ * @param output_stride bytes from an output image to the next one, 0 for the image size
+ * @param[in,out] output output type and custom buffer as for gpujpeg_decoder_decode(); on success data points to the
+ *                     first image, data_size and param_image describe each image and metadata points to count items
+ *                     (one per image). Decoder-owned buffers and the metadata are valid until the next decoding (also
+ *                     a failed one) or the destruction of the decoder. On failure the structure is not changed.
+ * @param[out] error_index index of the image that caused the failure, -1 for a failure of the whole call (invalid
+ *                     arguments, memory allocation, CUDA) or on success; may be NULL
+ * @retval GPUJPEG_NOERR                 success
+ * @retval GPUJPEG_ERR_BATCH_MISMATCH    image *error_index differs from the first image
+ * @retval GPUJPEG_ERR_BATCH_UNSUPPORTED the output, a decoder option or image *error_index is not supported in a batch
+ * @retval other                         @ref Errors, eg. a malformed image *error_index; caller buffers are written
+ *                                       only after all images were read, a CUDA failure afterwards leaves them
+ *                                       unspecified
+ */
+GPUJPEG_API int
+gpujpeg_decoder_decode_batch(struct gpujpeg_decoder* decoder, int count, uint8_t* const* images,
+                             const size_t* image_sizes, size_t output_stride, struct gpujpeg_decoder_output* output,
+                             int* error_index);
+
+/**
  * Returns duration statistics for last decoded image
  * @return 0 if succeeds, otherwise nonzero
  * @note

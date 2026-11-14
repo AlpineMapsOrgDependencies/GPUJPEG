@@ -288,11 +288,14 @@ gpujpeg_write_ifd(struct gpujpeg_writer* writer, const uint8_t* start, size_t co
 
     uint8_t *first_rec = writer->buffer_current;
     unsigned last_tag_id = 0;
+    const uint32_t placeholder = 0;
+    uint8_t* exif_ifd_pointer = NULL; // value of the generated Exif IFD pointer record, set when the target is known
     for ( unsigned i = 0; i < count; ++i ) {
         const struct tag_value* info = &tags[i];
         union value_u value = info->value;
         if ( info->tag == ETIFF_EXIF_IFD_POINTER ) {
-            value.uvalue = (uint32_t[]) {end - start};
+            value.uvalue = &placeholder;
+            exif_ifd_pointer = writer->buffer_current + 8; // after ID, type and count
         }
         const struct exif_tiff_tag_info_t* t = &exif_tiff_tag_info[info->tag];
         (void) last_tag_id; // suppress unused if assert not used
@@ -305,7 +308,15 @@ gpujpeg_write_ifd(struct gpujpeg_writer* writer, const uint8_t* start, size_t co
             write_exif_tag(writer, custom_tags->vals[i].type, custom_tags->vals[i].tag_id,
                            custom_tags->vals[i].val_count, custom_tags->vals[i].value, start, &end);
         }
-        // ensure custom_tags are in-ordered
+    }
+    if ( exif_ifd_pointer != NULL ) { // the Exif IFD follows all values of this IFD (also of custom tags)
+        uint8_t* const current = writer->buffer_current;
+        writer->buffer_current = exif_ifd_pointer;
+        gpujpeg_writer_emit_4byte(writer, end - start);
+        writer->buffer_current = current;
+    }
+    if ( custom_tags != NULL ) {
+        // ensure custom_tags are in-ordered (the records are moved)
         qsort(first_rec, (writer->buffer_current - first_rec) / IFD_ITEM_SZ, IFD_ITEM_SZ, ifd_sort);
     }
     gpujpeg_writer_emit_4byte(writer, 0); // Next IFD Offset (none)
@@ -385,6 +396,32 @@ gpujpeg_write_exif_ifd(struct gpujpeg_writer* writer, const uint8_t* start,
     size_t tag_count = ARR_SIZE(tags);
     tag_count = remove_overriden(tag_count, tags, custom_tags);
     gpujpeg_write_ifd(writer, start, ARR_SIZE(tags), tags, custom_tags);
+}
+
+/* Documented at declaration */
+size_t
+gpujpeg_exif_app1_length_bound(const struct gpujpeg_exif_tags* custom_tags)
+{
+    // as written by gpujpeg_writer_write_exif(): length field, Exif identifier with padding, TIFF header, 0th IFD
+    // (count, 7 entries, next IFD offset, 36 bytes of resolution and date values) and Exif IFD (6 entries with
+    // values in them)
+    size_t length = 2 + 6 + 8 + (2 + 7 * IFD_ITEM_SZ + NEXT_IFD_PTR_SZ + 36) + (2 + 6 * IFD_ITEM_SZ + NEXT_IFD_PTR_SZ);
+    for ( unsigned table = 0; custom_tags != NULL && table < CT_NUM; ++table ) {
+        for ( size_t i = 0; i < custom_tags->tags[table].count; ++i ) {
+            const struct custom_tag_value* tag = &custom_tags->tags[table].vals[i];
+            if ( tag->type <= ET_NONE || tag->type >= ET_END || exif_tag_type_info[tag->type].size == 0 ||
+                 tag->val_count == 0 || tag->val_count > 0xFFFF ) {
+                ERROR_MSG(MOD_NAME "Unsupported type or count of custom tag 0x%x!\n", (unsigned)tag->tag_id);
+                return 0;
+            }
+            // entry and its values (stored outside if longer than 4 bytes)
+            length += IFD_ITEM_SZ + (size_t)exif_tag_type_info[tag->type].size * tag->val_count;
+            if ( length > 0xFFFF ) {
+                return length; // not representable, without overflow
+            }
+        }
+    }
+    return length;
 }
 
 /// writes EXIF APP1 marker
@@ -591,7 +628,7 @@ gpujpeg_exif_tags_destroy(struct gpujpeg_exif_tags* exif_tags)
         return;
     }
     for ( unsigned i = 0; i < CT_NUM; ++i ) {
-        for (unsigned j = 0; i < exif_tags->tags[i].count; ++i) {
+        for ( unsigned j = 0; j < exif_tags->tags[i].count; ++j ) {
             free((void *) exif_tags->tags[i].vals[j].value.uvalue);
         }
         free(exif_tags->tags[i].vals);
